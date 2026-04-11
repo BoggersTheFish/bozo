@@ -27,7 +27,7 @@ def get_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--checkpoint",  required=True, help="Path to .pt checkpoint")
-    p.add_argument("--prompt",      default=None,  help="Input prompt (interactive if omitted)")
+    p.add_argument("--prompt",      default=None,  nargs="+", help="Input prompt (interactive if omitted)")
     p.add_argument("--max_new",     default=200,   type=int,   help="Max tokens to generate")
     p.add_argument("--temp",        default=0.80,  type=float, help="Sampling temperature (lower = more conservative)")
     p.add_argument("--top_p",       default=0.92,  type=float, help="Nucleus sampling probability")
@@ -88,6 +88,7 @@ def main():
     print_model_info(model, ckpt)
 
     if args.prompt:
+        args.prompt = " ".join(args.prompt)
         result = do_generate(model, tokenizer, args.prompt, args)
         print(result)
         if args.show_tension:
