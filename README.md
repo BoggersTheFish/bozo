@@ -143,18 +143,19 @@ All presets can be further tuned with individual flags (`--dim`, `--window`, etc
 
 ## GPU training (Milestone 2)
 
+Single GPU:
 ```bash
-# On a rented GPU instance (Vast.ai / RunPod)
-npm install -g @anthropic-ai/claude-code
-git clone https://github.com/BoggersTheFish/bozo.git
-cd bozo
-pip install torch tokenizers datasets matplotlib
-claude   # Claude Code CLI — run from here
-
-# The large preset configures everything for GPU:
 python3 train.py --preset large --model tension \
-  --out_dir checkpoints/tension_117M \
-  --log_csv logs/tension_117M.csv \
+  --out_dir checkpoints/tension_117m \
+  --log_csv logs/tension_117m.csv \
+  --epochs 3
+```
+
+Multi-GPU (DDP via torchrun):
+```bash
+torchrun --nproc_per_node=2 train.py --preset large --model tension \
+  --out_dir checkpoints/tension_117m \
+  --log_csv logs/tension_117m.csv \
   --epochs 3
 ```
 
@@ -162,15 +163,34 @@ The training loop auto-detects CUDA and enables:
 - `bf16` mixed precision (`torch.autocast`)
 - `torch.compile()` (Inductor backend)
 - `pin_memory=True` DataLoader
-- Up to 4 DataLoader workers
+- DDP (DistributedDataParallel) via `torchrun` when multiple GPUs are available
 
-Estimated GPU training time at 117M params, WikiText-103 (1B tokens, 3 epochs):
+Estimated GPU training time at 117M params, WikiText-103, 3 epochs:
 
-| GPU | Est. time | Cost |
-|-----|-----------|------|
-| RTX 3090 (~$0.25/hr) | 35–50h | ~$10 |
-| RTX 4090 (~$0.50/hr) | 15–20h | ~$10 |
-| A100 (~$1.50/hr) | 6–8h | ~$10 |
+| Setup | Est. time |
+|-------|-----------|
+| 1× RTX 4090 | ~30h |
+| 2× RTX 4090 (DDP) | ~17h |
+| 1× A100 | ~10h |
+
+### Large-scale training (FineWeb)
+
+For billion-token runs, pre-tokenise into binary shards first:
+
+```bash
+# Tokenise FineWeb 10B into shards
+python3 prepare_data.py \
+  --dataset fineweb-10B \
+  --out_dir data/fineweb-10B \
+  --tokenizer checkpoints/tension_117m/tokenizer.json
+
+# Train from shards with a token budget
+torchrun --nproc_per_node=2 train.py \
+  --data_dir data/fineweb-10B \
+  --train_tokens 10_000_000_000 \
+  --out_dir checkpoints/tension_117m_fw \
+  --log_csv logs/tension_117m_fw.csv
+```
 
 ---
 
@@ -180,11 +200,13 @@ Estimated GPU training time at 117M params, WikiText-103 (1B tokens, 3 epochs):
 |------|---------|
 | `model.py` | TensionLM architecture + aux losses + generation |
 | `baseline.py` | Baseline transformer (same API, softmax attention) |
-| `train.py` | Training pipeline — works for both architectures |
+| `train.py` | Training pipeline — single GPU, DDP, token budget, WandB |
+| `prepare_data.py` | Stream + tokenise large datasets into binary shards |
 | `compare.py` | Plot loss curves from two CSV logs side by side |
 | `eval.py` | Perplexity evaluation on any HuggingFace dataset |
+| `fill_results.py` | Auto-fill README results table from CSV logs |
 | `generate.py` | Inference CLI with sampling controls |
-| `tension_lm.py` | Original toy demo (word-level tokenizer, 200-token corpus) |
+| `upload_hf.py` | Upload checkpoint and tokenizer to HuggingFace Hub |
 
 ---
 
