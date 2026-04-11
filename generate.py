@@ -41,7 +41,13 @@ def load_model_and_tokenizer(ckpt_path: str):
     print(f"Loading {ckpt_path} ...")
     ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg   = TensionConfig(**ckpt["cfg"])
-    model = TensionLM(cfg)
+    arch  = ckpt.get("arch", "tension")
+
+    if arch == "transformer":
+        from baseline import TransformerLM
+        model = TransformerLM(cfg)
+    else:
+        model = TensionLM(cfg)
 
     # Strip _orig_mod. prefix present when checkpoint was saved from a compiled model
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}

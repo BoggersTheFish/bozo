@@ -14,3 +14,6 @@ env/
 *.pth
 *.ckpt
 .DS_Store
+checkpoints/
+logs/
+results/

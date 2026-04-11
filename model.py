@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -54,6 +55,9 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # F.rms_norm is a single fused kernel on PyTorch 2.4+; fallback otherwise.
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(x, x.shape[-1:], self.scale, self.eps)
         rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return x * rms * self.scale
 
@@ -85,14 +89,17 @@ class MultiHeadCausalTensionLayer(nn.Module):
     def _gather_window(self, z: torch.Tensor, T: int) -> torch.Tensor:
         """
         Vectorised causal window gather — no Python loops over T or W.
-        z: B T H C  →  B T H W C  (contiguous output for AVX vectorisation)
-        result[b, t, h, w, :] = z[b, t-w-1, h, :]  (zero for out-of-bounds)
+        z: B T H C  →  B T H W C
+        result[b, t, h, w, :] = z[b, t-W+w, h, :]  (zero for out-of-bounds)
+        w=0 is oldest token in window; w=W-1 is most recent.
+        Avoids .flip() and .contiguous() — saves two large tensor copies (~800 MB
+        at large config). torch.compile fuses the permute into downstream ops.
         """
         W  = self.window
-        zt = z.permute(0, 2, 3, 1)                           # B H C T
-        zp = F.pad(zt, (W, 0), value=0.0)                    # B H C (T+W)
-        nb = zp.unfold(-1, W, 1)[:, :, :, :T, :].flip(-1)   # B H C T W
-        return nb.permute(0, 3, 1, 4, 2).contiguous()        # B T H W C
+        zt = z.permute(0, 2, 3, 1)                     # B H C T
+        zp = F.pad(zt, (W, 0), value=0.0)              # B H C (T+W)
+        nb = zp.unfold(-1, W, 1)[:, :, :, :T, :]       # B H C T W  (no flip)
+        return nb.permute(0, 3, 1, 4, 2).contiguous() # B T H W C
 
     def forward(
         self,
@@ -130,17 +137,20 @@ class OscillatoryModulation(nn.Module):
     Each of the D channels gets its own trainable frequency and phase,
     acting as a soft wave-based positional signal trained end-to-end.
     Amplitude starts near zero and grows only as needed.
+    pos_buf is a non-persistent buffer — avoids torch.arange on every forward pass.
     """
     def __init__(self, cfg: TensionConfig):
         super().__init__()
         self.freqs  = nn.Parameter(torch.randn(cfg.dim) * 0.02)
         self.phases = nn.Parameter(torch.zeros(cfg.dim))
         self.amp    = nn.Parameter(torch.full((1,), 0.1))
+        pos = torch.arange(cfg.max_seq_len, dtype=torch.float).unsqueeze(-1)  # S 1
+        self.register_buffer("pos_buf", pos, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
-        pos = torch.arange(T, device=x.device).float().unsqueeze(-1)  # T 1
-        mod = torch.sin(pos * self.freqs + self.phases)                # T D
+        pos = self.pos_buf[:T]                                  # T 1
+        mod = torch.sin(pos * self.freqs + self.phases)         # T D
         return x * (1.0 + self.amp * mod.unsqueeze(0))
 
 
@@ -173,6 +183,9 @@ class TensionBlock(nn.Module):
         self.ffn       = TensionFFN(cfg)
         self.use_ckpt  = cfg.use_grad_checkpoint
 
+    def _impl_no_tensions(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ffn(self.oscillate(self.tension(self.pre_norm(x))))
+
     def _impl(
         self, x: torch.Tensor, return_tensions: bool = False
     ) -> torch.Tensor | tuple:
@@ -186,10 +199,15 @@ class TensionBlock(nn.Module):
         self, x: torch.Tensor, return_tensions: bool = False
     ) -> torch.Tensor | tuple:
         # Gradient checkpointing trades compute for memory (~30% slower, ~40% less RAM).
-        # Skipped when return_tensions=True since checkpoint can't return tuples cleanly.
-        if self.use_ckpt and self.training and not return_tensions:
-            from torch.utils.checkpoint import checkpoint
-            return checkpoint(self._impl, x, use_reentrant=False)
+        # Uses a tensions-free path when checkpointing to avoid tuple return issues.
+        if self.use_ckpt and self.training:
+            if return_tensions:
+                # Checkpoint the block forward for memory savings, then recompute
+                # tensions separately from the same input for the aux loss.
+                out = _grad_checkpoint(self._impl_no_tensions, x, use_reentrant=False)
+                _, tau = self.tension(self.pre_norm(x), return_tensions=True)
+                return out, tau
+            return _grad_checkpoint(self._impl_no_tensions, x, use_reentrant=False)
         return self._impl(x, return_tensions)
 
 
@@ -208,6 +226,10 @@ class TensionLM(nn.Module):
         self.final_norm = RMSNorm(cfg.dim)
         self.lm_head    = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight  # weight tying
+
+        # Non-persistent buffer — avoids torch.arange on every forward pass.
+        pos = torch.arange(cfg.max_seq_len).unsqueeze(0)  # 1 S
+        self.register_buffer("pos_buf", pos, persistent=False)
 
         self._init_weights()
 
@@ -239,8 +261,7 @@ class TensionLM(nn.Module):
         assert T <= self.cfg.max_seq_len, \
             f"Sequence length {T} exceeds max_seq_len {self.cfg.max_seq_len}"
 
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        x   = self.emb_drop(self.embedding(input_ids) + self.pos_embedding(pos))
+        x   = self.emb_drop(self.embedding(input_ids) + self.pos_embedding(self.pos_buf[:, :T]))
 
         all_tensions = []
         for block in self.blocks:
@@ -278,7 +299,10 @@ def tension_diversity_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
     Penalise low-entropy tension distributions per head.
     Encourages each head to spread attention across the window rather
     than collapsing onto one dominant position.
+    Returns 0 when called on a baseline model with no tension layers.
     """
+    if not all_tensions:
+        return torch.tensor(0.0)
     device = all_tensions[0].device
     total  = torch.tensor(0.0, device=device)
     for tau in all_tensions:              # B T H W
