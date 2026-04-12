@@ -233,16 +233,21 @@ def load_checkpoint(path: str, device: torch.device):
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, max_batches: int = 60) -> float:
-    model.eval()
+    # Use the unwrapped base model to bypass DDP's buffer broadcast.
+    # DDP normally broadcasts all buffers (including pos_buf) from rank 0 to
+    # all ranks before each forward — but during eval only rank 0 runs forwards
+    # while rank 1 waits at the barrier, causing a deadlock + 600s NCCL timeout.
+    base = _unwrap(model)
+    base.eval()
     total, n = 0.0, 0
     for i, (x, y) in enumerate(loader):
         if i >= max_batches:
             break
         x, y   = x.to(device), y.to(device)
-        logits = model(x)   # use compiled model — _unwrap bypasses torch.compile
+        logits = base(x)
         total += criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1)).item()
         n     += 1
-    model.train()
+    base.train()
     return math.exp(min(total / max(n, 1), 20))
 
 
@@ -304,6 +309,9 @@ def tokenize(tokenizer, text: str, max_tokens: int | None = None) -> list[int]:
 
 def train(args):
     rank, world_size, device, is_main = setup_ddp()
+
+    # TF32 matmuls on Ampere+ GPUs — free throughput, negligible accuracy loss
+    torch.set_float32_matmul_precision("high")
 
     out_dir  = args.out_dir
     tok_path = os.path.join(out_dir, "tokenizer.json")
@@ -409,7 +417,7 @@ def train(args):
     # Compile first, then wrap with DDP
     if device.type == "cuda":
         try:
-            model = torch.compile(model)
+            model = torch.compile(model, dynamic=True)
             if is_main:
                 print("torch.compile: enabled")
         except Exception as e:
@@ -417,7 +425,8 @@ def train(args):
                 print(f"torch.compile: skipped ({e})")
 
     if world_size > 1:
-        model = DDP(model, device_ids=[device.index])
+        model = DDP(model, device_ids=[device.index],
+                    find_unused_parameters=False, broadcast_buffers=False)
         if is_main:
             print(f"DDP: {world_size} GPUs")
     else:
@@ -497,11 +506,12 @@ def train(args):
             print("Aux losses: disabled")
         print("─" * 72)
 
-    step     = start_step
-    raw_step = 0
-    best_ppl = float("inf")
-    t_start  = time.time()
-    done     = False
+    step          = start_step
+    raw_step      = 0
+    best_ppl      = float("inf")
+    t_start       = time.time()
+    t_first_step  = None   # set after first optimizer step — excludes compile warmup
+    done          = False
     optimizer.zero_grad()
 
     for epoch in range(1, max_epochs + 1):
@@ -544,12 +554,15 @@ def train(args):
             optimizer.step()
             optimizer.zero_grad()
             step += 1
+            if t_first_step is None:
+                t_first_step = time.time()
 
             # ── Logging (rank 0) ──
             if is_main and step % args.log_every == 0:
-                elapsed = time.time() - t_start
+                elapsed = time.time() - t_first_step
+                steps_so_far = step - start_step
                 ppl     = math.exp(min(loss_ce.item(), 20))
-                sps     = step / max(elapsed, 1)
+                sps     = steps_so_far / max(elapsed, 1)
                 eta_h   = (total_steps - step) / max(sps * 3600, 1)
                 print(
                     f"ep {epoch:2d} | step {step:6d}/{total_steps} | "
@@ -585,10 +598,11 @@ def train(args):
                     dist.barrier()
 
             # ── Periodic save ──
-            elif step % args.save_every == 0 and is_main:
-                val_ppl = evaluate(model, val_loader, criterion, device)
-                save_checkpoint(out_dir, step, model, optimizer,
-                                val_ppl, cfg, tok_path, vars(args))
+            elif step % args.save_every == 0:
+                if is_main:
+                    val_ppl = evaluate(model, val_loader, criterion, device)
+                    save_checkpoint(out_dir, step, model, optimizer,
+                                    val_ppl, cfg, tok_path, vars(args))
                 if world_size > 1:
                     dist.barrier()
 

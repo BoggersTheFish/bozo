@@ -303,14 +303,12 @@ def tension_diversity_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
     """
     if not all_tensions:
         return torch.tensor(0.0)
-    device = all_tensions[0].device
-    total  = torch.tensor(0.0, device=device)
-    for tau in all_tensions:              # B T H W
-        _, _, _, W = tau.shape
-        p       = tau / (tau.sum(-1, keepdim=True) + 1e-8)
-        entropy = -(p * torch.log(p + 1e-8)).sum(-1)   # B T H
-        total   = total + F.relu(math.log(W) - entropy.mean())
-    return total / len(all_tensions)
+    # Stack layers → single fused kernel instead of L sequential kernels
+    tau  = torch.stack(all_tensions)              # L B T H W
+    W    = tau.shape[-1]
+    p    = tau / (tau.sum(-1, keepdim=True) + 1e-8)
+    ent  = -(p * torch.log(p + 1e-8)).sum(-1)     # L B T H
+    return F.relu(math.log(W) - ent.mean()).mean()
 
 
 # ── Generation ────────────────────────────────────────────────────────────────

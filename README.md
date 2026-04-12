@@ -78,6 +78,25 @@ Both models are trained on **WikiText-2** with identical config (dim=128, 4 laye
 Plot: `results/comparison.png`
 > **Result:** TensionLM wins by 0.1 PPL points (TensionLM 57.7 vs Transformer 57.8 on WikiText-2 val).
 
+---
+
+## 117M scale results (WikiText-103)
+
+Trained for 3 epochs (~0.34B tokens) on WikiText-103 with the `--preset large` config. 2× RTX 4090 D, DDP, bf16, torch.compile.
+
+| Metric | Value |
+|--------|-------|
+| Final val PPL | **32.01** |
+| Best val PPL | **32.33** (step 5000) |
+| Parameters | 118M |
+| Training time | ~9h (2× RTX 4090 D) |
+
+Model available on HuggingFace: [BoggersTheFish/TensionLM-117M](https://huggingface.co/BoggersTheFish/TensionLM-117M)
+
+Sample output at val PPL 32:
+
+> *"The war began in March, when an army of 42,000 men under his command became part of a new militia unit formed along the River Plate... This force was composed of two battalions under General Sir Thomas Fairfax and Major Robert Cornwallis, along with the British left wing."*
+
 
 ---
 
