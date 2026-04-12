@@ -2,6 +2,8 @@
 
 A language model built on **CausalTensionGraphs** instead of softmax attention.
 
+**[117M model on HuggingFace](https://huggingface.co/BoggersTheFish/TensionLM-117M)** | **[GitHub](https://github.com/BoggersTheFish/bozo)**
+
 ---
 
 ## The idea
