@@ -98,6 +98,12 @@ def get_args():
     p.add_argument("--max_seq_len", default=256,   type=int)
     p.add_argument("--dropout",     default=0.10,  type=float)
     p.add_argument("--grad_ckpt",   action="store_true")
+    p.add_argument("--no_osc",      action="store_true",
+                   help="Disable OscillatoryModulation (ablation)")
+    p.add_argument("--rope",        action="store_true",
+                   help="Use Rotary Position Embeddings (replaces learned pos + OscillatoryModulation)")
+    p.add_argument("--triton",      action="store_true",
+                   help="Use fused Triton kernel for tension op (CUDA only)")
     # Training
     p.add_argument("--seq_len",       default=64,   type=int)
     p.add_argument("--batch_size",    default=32,   type=int)
@@ -122,6 +128,21 @@ def get_args():
     p.add_argument("--wandb",         action="store_true",
                    help="Log metrics to Weights & Biases")
     p.add_argument("--wandb_project", default="tensionlm")
+
+    # Apply preset as set_defaults so explicit CLI args always win
+    pre, _ = p.parse_known_args()
+    if pre.preset == "medium":
+        p.set_defaults(
+            dim=256, num_layers=6, num_heads=4, window=16,
+            max_seq_len=512, seq_len=256, batch_size=16,
+        )
+    elif pre.preset == "large":
+        p.set_defaults(
+            dim=768, num_layers=12, num_heads=12, window=64, ffn_mult=3,
+            max_seq_len=1024, seq_len=512, batch_size=8, grad_accum=8,
+            vocab_size=32768, dataset="wikitext-103-raw-v1", warmup_steps=2000,
+        )
+
     return p.parse_args()
 
 
@@ -206,7 +227,8 @@ def _unwrap(model) -> TensionLM:
     return model
 
 
-def save_checkpoint(out_dir, step, model, optimizer, val_ppl, cfg, tok_path, args_dict):
+def save_checkpoint(out_dir, step, model, optimizer, val_ppl, cfg, tok_path, args_dict,
+                    max_ckpts: int = 3):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     state = {
         "step":      step,
@@ -223,6 +245,11 @@ def save_checkpoint(out_dir, step, model, optimizer, val_ppl, cfg, tok_path, arg
     torch.save(state, numbered)
     torch.save(state, latest)
     print(f"  Saved → {numbered}  (val ppl {val_ppl:.2f})")
+
+    # Prune old numbered checkpoints, keeping only the most recent max_ckpts
+    existing = sorted(Path(out_dir).glob("ckpt_*.pt"))
+    for old in existing[:-max_ckpts]:
+        old.unlink()
 
 
 def load_checkpoint(path: str, device: torch.device):
@@ -407,6 +434,9 @@ def train(args):
         max_seq_len         = args.max_seq_len,
         dropout             = args.dropout,
         use_grad_checkpoint = args.grad_ckpt,
+        use_oscillation     = not args.no_osc,
+        use_rope            = args.rope,
+        use_triton          = args.triton,
     )
     if args.model == "transformer":
         from baseline import TransformerLM
@@ -417,9 +447,13 @@ def train(args):
     # Compile first, then wrap with DDP
     if device.type == "cuda":
         try:
-            model = torch.compile(model, dynamic=True)
+            # dynamic=False: shard-based training has fixed input shapes — lets the
+            # compiler generate shape-specific kernels instead of symbolic-shape code.
+            # max-autotune-no-cudagraphs: full kernel autotuning without CUDAGraphs
+            # (no-cudagraphs is safer with DDP's gradient hook mechanism).
+            model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
             if is_main:
-                print("torch.compile: enabled")
+                print("torch.compile: max-autotune-no-cudagraphs, dynamic=False")
         except Exception as e:
             if is_main:
                 print(f"torch.compile: skipped ({e})")
@@ -639,34 +673,11 @@ def train(args):
 # ── Presets ───────────────────────────────────────────────────────────────────
 
 def apply_preset(args):
-    if args.preset is None:
-        return
-    if args.preset == "small":
-        pass  # defaults are already small
-    elif args.preset == "medium":
-        args.dim         = 256
-        args.num_layers  = 6
-        args.num_heads   = 4
-        args.window      = 16
-        args.max_seq_len = 256
-        args.seq_len     = 128
-        args.batch_size  = 16
-    elif args.preset == "large":
-        args.dim          = 768
-        args.num_layers   = 12
-        args.num_heads    = 12
-        args.window       = 64
-        args.ffn_mult     = 3
-        args.max_seq_len  = 1024
-        args.seq_len      = 512
-        args.batch_size   = 8
-        args.grad_accum   = 8
-        args.vocab_size   = 32768
-        args.grad_ckpt    = False
-        args.dataset      = "wikitext-103-raw-v1"
-        args.warmup_steps = 2000
-    print(f"Preset '{args.preset}' applied: dim={args.dim}  "
-          f"layers={args.num_layers}  window={args.window}  vocab={args.vocab_size}")
+    # Preset values are now injected via set_defaults in get_args() so CLI args
+    # always take precedence. This function just prints the summary.
+    if args.preset:
+        print(f"Preset '{args.preset}' applied: dim={args.dim}  "
+              f"layers={args.num_layers}  window={args.window}  vocab={args.vocab_size}")
 
 
 if __name__ == "__main__":

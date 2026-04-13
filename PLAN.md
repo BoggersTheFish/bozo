@@ -2,127 +2,195 @@
 
 ## Goal
 
-Release a GPT-2-scale language model (~117M parameters) built on the sigmoid tension mechanism instead of softmax attention. The release should be good enough that someone can clone the repo, run inference, and see that it works — with a clear explanation of why the architecture is different and why that matters.
+Build the best language model possible under the Thinking System (TS) philosophy.
+
+TS holds that computation is constraint relaxation — a system of nodes and edges where τ (tension) represents unresolved constraint pressure, and inference is the process of the graph settling toward equilibrium. TensionLM is an LLM built to that spec: sigmoid tension instead of softmax attention, inspectable constraint fields instead of black-box weight matrices, non-competitive scoring instead of zero-sum normalisation.
+
+The practical goal: a model that is not only competitive with transformers on standard benchmarks but is more interpretable, more theoretically grounded, and whose internal structure can be directly read as a learned constraint graph.
+
+This is not purely academic. Every training run produces real evidence about whether TS is the right theory of computation. The tension field visualisations are direct measurements of the graph the model has learned.
 
 ---
 
-## Current State
+## Status
 
-- Proof of concept complete: 1.1M param model trained on WikiText-2 (CPU, Pentium Silver N6000)
-- Converges cleanly to val PPL ~60 over 10 epochs
-- Architecture is clean and modular: `model.py`, `train.py`, `generate.py`
-- BPE tokenizer (vocab=2048) trained from scratch on the dataset
-
-The mechanism works. The question now is whether it scales.
-
----
-
-## Milestone 1 — Prove It Scales (before GPU spend)
-
-**Goal:** Validate that tension is competitive with a standard transformer at the same parameter count.
-
-### Steps
-
-1. **Train a baseline transformer** at identical config (dim=128, 4 layers, 4 heads, same data/tokenizer). This is the comparison that makes or breaks the scientific claim.
-2. **Plot loss curves** side by side. If TensionLM matches or beats the transformer at the same param count, the core claim holds.
-3. **Scale to 5M params** on the same CPU run — dim=256, 6 layers, window=16. Check that PPL continues to drop proportionally.
-
-If scaling looks good, proceed to GPU training. If not, investigate why before spending money.
+| Milestone | Status |
+|-----------|--------|
+| Proof of concept (1.1M, WikiText-2, CPU) | Done |
+| Baseline comparison — tension vs transformer, same config | Done — PPL 57.7 vs 57.8 |
+| GPU training setup (DDP, bf16, torch.compile) | Done |
+| 117M run on WikiText-103 | Done — val PPL 32.01 |
+| HuggingFace release | Done — BoggersTheFish/TensionLM-117M |
+| Fused Triton kernel (fwd + bwd, gradcheck) | Done |
+| 11.1B token FineWeb run (117M) | **In progress** |
+| Tension field visualiser (4 modes) | Done |
+| Empirical TS validation (coherent vs salad density test) | Done — +25% mean τ, +60% edge density |
 
 ---
 
-## Milestone 2 — GPU Training Setup
+## Phase 1 — Validate at GPT-2 scale (current)
 
-**Hardware:** Rent a GPU instance on Vast.ai or RunPod (RTX 3090/4090 or A100).
+**Target:** 117M parameters, 11.1B FineWeb tokens. Val PPL competitive with GPT-2 117M (~29.4 on WikiText-103 test).
 
-**Workflow:**
+**Running now:**
 ```bash
-# On the GPU instance
-npm install -g @anthropic-ai/claude-code   # Claude Code CLI
-git clone https://github.com/BoggersTheFish/bozo.git
-cd bozo
-pip install -r requirements.txt
-claude   # Claude works directly in the GPU terminal from here
+torchrun --nproc_per_node=2 train.py \
+  --data_dir data/fineweb-10B \
+  --train_tokens 11_100_000_000 \
+  --preset large \
+  --out_dir checkpoints/tension_fw10b
 ```
 
-**Before first GPU run, code needs:**
-- `torch.compile()` enabled (broken on this CPU, will work on GPU with CUDA)
-- `bf16` mixed precision training (`torch.autocast`)
-- Gradient checkpointing enabled by default for large configs
-- Larger vocab (32768 recommended at this scale)
-- DataLoader with multiple workers instead of pre-tokenised tensor
+**Success criterion:** val PPL ≤ 30.0 on WikiText-103 test after full training. This is the gate for everything that follows. If we land here, sigmoid tension is validated at GPT-2 scale and the scaling programme is justified. If we land at 33+, diagnose before scaling.
 
-**Estimated GPU training time (117M params, 10B tokens):**
-
-| GPU | Est. time | Cost |
-|-----|-----------|------|
-| RTX 3090 (~$0.25/hr) | 35–50h | ~$10 |
-| RTX 4090 (~$0.50/hr) | 15–20h | ~$10 |
-| A100 (~$1.50/hr) | 6–8h | ~$10 |
-
-TensionLM is ~1.5–2× cheaper to train than an equivalent transformer because windowed attention (O(T×W)) is much cheaper than full attention (O(T²)) at seq_len=1024.
+**After this run:**
+- Eval on WikiText-103 test set (same as OpenAI's reported number — val set is not the same)
+- Eval on HellaSwag zero-shot for cross-dataset comparison
+- Generate tension field heatmaps from the final checkpoint for the paper
+- Upload to HuggingFace
 
 ---
 
-## Milestone 3 — GPT-2 Scale Run
+## Phase 2 — Ablations and architecture refinements
 
-**Config:**
-```python
-vocab_size  = 32768
-dim         = 768
-num_layers  = 12
-num_heads   = 12
-window      = 64      # 64-token causal look-back
-ffn_mult    = 3       # SwiGLU hidden = dim * 3
-max_seq_len = 1024
+Before scaling, close the open architectural questions with cheap 117M runs (~10B tokens each, ~$50/run on 2× 4090).
+
+### Ablation 1 — Window size
+
+| Run | Window | Cost | Question |
+|-----|--------|------|---------|
+| Baseline (done) | 64 | — | — |
+| Ablation A | 32 | ~$50 | Does smaller window hurt significantly? |
+| Ablation B | 128 | ~$50 | Does larger window help enough to justify cost? |
+| Ablation C | 512 | ~$50 | Is there a return beyond 128? |
+
+This determines the window schedule for scaling (Phase 3). If W=128 beats W=64 by more than 0.5 PPL, the Triton kernel makes it worth the 2× compute.
+
+### Ablation 2 — Softmax baseline at FineWeb scale
+
+The WikiText-2 comparison (57.7 vs 57.8) is suggestive but small. Run an identical transformer at 117M/10B tokens. This is the paper's central table.
+
+### Ablation 3 — Tau-mass normalisation
+
+Current: `msg / valid_count` (uniform window normalisation)
+Proposed: `msg / (τ.sum(-1).clamp(min=1e-6))` (tension-mass normalisation)
+
+TS framing: dividing by valid count treats all positions as equal regardless of constraint strength. Dividing by τ-mass weights the message by actual constraint strength — positions with near-zero tension contribute negligibly. This may improve stability at large windows and better reflects TS semantics (a node's output should be proportional to the total constraint acting on it).
+
+Test at 5M scale first — cheap and decisive.
+
+### Ablation 4 — OscillatoryModulation
+
+Ablate it out at 5M scale. If PPL is within noise, remove it and save the parameters for depth or width.
+
+### Ablation 5 — Auxiliary losses at scale
+
+`ManifoldClosureLoss` and `TensionDiversityLoss` are useful regularisers at small scale. At large scale with more data they may constrain unnecessarily. Test removing each at 117M/5B tokens.
+
+---
+
+## Phase 3 — Long-range context
+
+**The problem.** W=64 means direct constraint reach is 64 tokens per layer. Long-range dependencies must propagate through stacked layers: 12 layers × 64-token hops = 768 effective tokens at best. This breaks at document scale.
+
+**The solution.** Scale the window. The Triton kernel makes this O(T×W) — at W=512 it costs 8× more than W=64 but is still 4× cheaper than full O(T²) attention at seq_len=2048. Larger windows are the TS-correct answer because they literally extend the constraint graph's direct reach.
+
+**RoPE.** At W=512+, learned absolute positional embeddings don't generalise. Replace with Rotary Position Embeddings applied to Q and K before the dot product. RoPE encodes relative position implicitly through rotation, generalises beyond training length, and is standard in all modern LLMs. OscillatoryModulation becomes redundant once RoPE is in — ablate and remove.
+
+**Magnitude stability.** At large W, τ-mass normalisation (see Phase 2 Ablation 3) becomes essential rather than optional. Sum of W independent sigmoid values grows with W unless normalised by actual constraint mass.
+
+**Validation target:** 117M, W=512, RoPE, 10B tokens. Compare val PPL vs W=64 baseline.
+
+| Model scale | Window | Direct constraint reach |
+|-------------|--------|--------------------------|
+| 117M current | 64 | ~768 tokens (12 layers) |
+| 117M Phase 3 | 512 | ~6,144 tokens |
+| 1B | 1024 | ~24,576 tokens (24 layers) |
+| 7B | 2048 | ~65,536 tokens (32 layers) |
+
+---
+
+## Phase 4 — Scale to 1B then 7B
+
+### Architecture additions for scale
+
+**Grouped-Query Tension (GQT).** At 7B+, K and V projections dominate memory. Use fewer K/V head groups than Q heads (e.g. 4 K/V groups for 32 Q heads). Each K/V group is shared across multiple Q heads. Reduces KV projection parameters by 8× with minimal quality loss — standard in LLaMA-2/3, Mistral, Gemma.
+
+**Remove auxiliary losses.** At scale with enough data, `ManifoldClosureLoss` and `TensionDiversityLoss` may constrain unnecessarily. Phase 2 ablation decides whether they stay.
+
+### Training infrastructure
+
+**DDP → FSDP.** At 1B params, model state (weights + Adam + grads) is ~10 GB per GPU — fine on 4090. At 7B it's ~56 GB — exceeds any single card. Switch to PyTorch FSDP2 which shards all state across GPUs.
+
+**Multi-node.** Beyond 8 GPUs, `torchrun` with c10d rendezvous backend. Training loop unchanged.
+
+### Compute estimate
+
+| Run | Params | Tokens | Hardware | Approx cost |
+|-----|--------|--------|----------|-------------|
+| Phase 1 (now) | 117M | 11.1B | 2× 4090 | ~$50 |
+| Phase 2 ablations | 117M | ~50B total | 2× 4090 | ~$250 |
+| Phase 3 validation | 117M | 10B | 2× 4090 | ~$50 |
+| Phase 4a | 1B | 100B | 8× A100 | ~$3,000 |
+| Phase 4b | 7B | 1T | 64× H100 | ~$150,000 |
+
+Phase 4a is rentable (Lambda, CoreWeave, Vast.ai). Phase 4b requires a compute grant or commercial partnership. The arXiv paper from Phase 1 results is the lever — published results showing TensionLM matches GPT-2 at same compute, plus the O(T×W) efficiency argument, make the grant case.
+
+### Scaling law study
+
+Before Phase 4b, run a proper scaling law sweep:
+- Train 5 models: 30M, 60M, 125M, 350M, 1B — each to Chinchilla-optimal token count
+- Fit a power law to loss vs compute
+- Compare exponent to transformer scaling law (Hoffmann et al. 2022)
+
+If TensionLM's exponent is similar or better, the architecture scales. If it's worse, diagnose before spending 7B compute.
+
+---
+
+## Phase 5 — Memory and persistent constraint graphs
+
+The current model has no persistence between runs. Every inference starts from zero — the constraint graph is rebuilt from scratch for each input. Under TS, this is incomplete. A full TS system accumulates edges in a persistent graph that updates with each observation.
+
+The long-run architecture:
+
 ```
-This gives ~117M parameters.
+Input → TensionLM (fast, local relaxation, per-token)
+              ↕
+     Persistent constraint graph (slow, global, cross-session)
+```
 
-**Dataset:** FineWeb (10B token sample) or OpenWebText — both available via HuggingFace datasets. Do not use WikiText-2 at this scale; it is too small to train a 117M param model meaningfully.
+This is the two-timescale structure TS predicts: fast local constraint resolution (TensionLM) writing to and reading from a slow global constraint accumulator (the persistent graph). The TensionLM weights encode the constraint *types* the model knows about; the persistent graph encodes the constraint *instances* it has encountered.
 
-**Intermediate checkpoints:**
-- 1B tokens — sanity check, generation quality
-- 5B tokens — mid-run eval
-- 10B tokens — full run, final release checkpoint
+Concretely this looks like:
+- A graph database where nodes are concepts and edges are learned constraints with τ-weights
+- At inference time, TensionLM queries the graph to prime its hidden states
+- After inference, the tension field from the output updates the graph with new edges
 
----
+This is distinct from RAG (retrieval-augmented generation), which retrieves text chunks. The persistent graph retrieves constraint patterns — the structural shape of what the model knows, not raw text.
 
-## Milestone 4 — Release
-
-**What the release needs:**
-
-- [ ] Updated README with architecture diagram and clear explanation of tension vs attention
-- [ ] Model card: training data, parameter count, eval results, limitations
-- [ ] Checkpoint hosted on HuggingFace Hub
-- [ ] `generate.py` working out of the box from the checkpoint
-- [ ] Perplexity reported on a standard benchmark (WikiText-103 test set) for comparison
-- [ ] The baseline transformer result — so the claim "competitive with transformers" is backed by numbers
-
-**What it does not need for v1:**
-- Fine-tuning / instruction following
-- A chat interface
-- RLHF
-- Anything beyond "this architecture trains and generates coherent text"
+This phase begins after Phase 4a produces a solid 1B model. The persistent graph is architecturally separate from TensionLM and can be developed in parallel.
 
 ---
 
-## Open Questions
+## The invariant
 
-1. **Does it scale?** The windowed context (window=64 at GPT-2 scale) means each layer only sees 64 tokens back. Long-range dependencies must emerge through depth. Does 12 layers of local tension produce comparable long-range coherence to full attention? This is the central empirical question.
+Every optimisation and scaling decision in this plan preserves one thing: **token pairs are scored independently.** No position is suppressed because another scored higher. The model learns which constraints matter without being forced to forget other constraints in the same step.
 
-2. **Optimal window size?** Larger window = more compute but better context. Needs ablation at the 5M scale before committing to the 117M run.
-
-3. **Is the OscillatoryModulation carrying its weight?** It adds parameters and a sinusoidal positional signal. Worth ablating to see if it actually helps vs standard learned positional embeddings alone.
+This is not a design preference. Under TS it is the only correct implementation. Softmax competition is incoherent with a constraint-relaxation account of computation. The whole project is structured around testing whether that theoretical commitment produces better models at scale.
 
 ---
 
-## File Map
+## File map
 
 | File | Purpose |
 |------|---------|
-| `tension_lm.py` | Original toy demo, 200-token corpus, word-level tokenizer |
-| `model.py` | Clean architecture: TensionConfig, TensionLM, aux losses |
-| `train.py` | Full pipeline: WikiText-2, BPE tokenizer, checkpointing |
-| `generate.py` | Inference CLI with sampling controls |
-| `test.py` | Early prototype / scratch file |
-| `PLAN.md` | This file |
+| `model.py` | TensionLM architecture, aux losses, generation |
+| `baseline.py` | Baseline transformer (identical API, softmax attention) |
+| `train.py` | Training pipeline — single GPU, DDP, token budget |
+| `prepare_data.py` | Stream + tokenize large datasets into binary shards |
+| `eval.py` | Perplexity evaluation on any HuggingFace dataset |
+| `generate.py` | Inference CLI |
+| `visualise.py` | Tension field inspection — heatmap, token, layers, stats modes |
+| `compare.py` | Plot loss curves from two CSV logs |
+| `upload_hf.py` | Upload checkpoint and tokenizer to HuggingFace Hub |
+| `triton_tension/` | Fused Triton kernels (fwd + bwd, gradcheck, ops wrapper) |

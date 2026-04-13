@@ -38,11 +38,46 @@ class TensionConfig:
     max_seq_len:         int   = 256
     dropout:             float = 0.10
     use_grad_checkpoint: bool  = False
+    use_oscillation:     bool  = True   # set False to ablate OscillatoryModulation
+    use_rope:            bool  = False  # Rotary Position Embeddings (replaces learned pos + OscillatoryModulation)
+    use_triton:          bool  = False  # Fused Triton kernel for tension op (requires CUDA)
 
     @property
     def head_dim(self) -> int:
         assert self.dim % self.num_heads == 0, "dim must be divisible by num_heads"
         return self.dim // self.num_heads
+
+
+# ── Rotary Position Embedding ─────────────────────────────────────────────────
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embeddings (RoPE) — Su et al. 2021.
+
+    Encodes relative position implicitly: dot(RoPE(q, t), RoPE(k, s)) depends
+    only on the relative offset (t - s), not on absolute positions.  This means
+    the model generalises to sequence lengths beyond its training window.
+
+    Replaces both learned absolute positional embeddings and OscillatoryModulation
+    when use_rope=True.  Applied to Q and K before the tension dot product;
+    V is left unrotated (standard practice).
+    """
+    def __init__(self, head_dim: int, max_seq_len: int, base: int = 10_000):
+        super().__init__()
+        half  = head_dim // 2
+        theta = 1.0 / (base ** (torch.arange(0, half).float() / half))  # half
+        pos   = torch.arange(max_seq_len).float()                        # S
+        freqs = torch.outer(pos, theta)                                  # S × half
+        self.register_buffer("cos", freqs.cos(), persistent=False)       # S × half
+        self.register_buffer("sin", freqs.sin(), persistent=False)       # S × half
+
+    def forward(self, x: torch.Tensor, T: int) -> torch.Tensor:
+        """x: B T H HD  →  B T H HD (rotated)"""
+        cos = self.cos[:T].unsqueeze(0).unsqueeze(2)   # 1 T 1 half
+        sin = self.sin[:T].unsqueeze(0).unsqueeze(2)   # 1 T 1 half
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
@@ -74,11 +109,12 @@ class MultiHeadCausalTensionLayer(nn.Module):
     """
     def __init__(self, cfg: TensionConfig):
         super().__init__()
-        self.window    = cfg.window
-        self.num_heads = cfg.num_heads
-        self.head_dim  = cfg.head_dim
-        self.scale     = math.sqrt(self.head_dim)
-        D              = cfg.dim
+        self.window     = cfg.window
+        self.num_heads  = cfg.num_heads
+        self.head_dim   = cfg.head_dim
+        self.scale      = math.sqrt(self.head_dim)
+        self.use_triton = cfg.use_triton
+        D               = cfg.dim
 
         self.wq      = nn.Linear(D, D, bias=False)
         self.wkv     = nn.Linear(D, D * 2, bias=False)  # k and v fused — one matmul
@@ -86,20 +122,44 @@ class MultiHeadCausalTensionLayer(nn.Module):
         self.norm    = RMSNorm(D)
         self.dropout = nn.Dropout(cfg.dropout)
 
+        # RoPE (optional) — applied to Q and K before the dot product.
+        self.rope = RotaryEmbedding(cfg.head_dim, cfg.max_seq_len) if cfg.use_rope else None
+
+        # Precomputed causal validity mask: (t, w) is valid when t + w >= W.
+        # The Triton kernel handles this via a bounds check and doesn't need the buffer.
+        # The unfold path still uses it.
+        t_idx = torch.arange(cfg.max_seq_len).unsqueeze(1)  # S 1
+        w_idx = torch.arange(cfg.window).unsqueeze(0)        # 1 W
+        self.register_buffer(
+            "causal_mask",
+            (t_idx + w_idx >= cfg.window).float(),           # S W
+            persistent=False,
+        )
+
+        # Valid-position count per query token: min(t, W).
+        # Used for magnitude normalisation — divides msg by the number of positions
+        # actually contributing, keeping output scale stable as W grows.
+        self.register_buffer(
+            "valid_count",
+            (t_idx + w_idx >= cfg.window).float().sum(-1).clamp(min=1),  # S
+            persistent=False,
+        )
+
     def _gather_window(self, z: torch.Tensor, T: int) -> torch.Tensor:
         """
         Vectorised causal window gather — no Python loops over T or W.
         z: B T H C  →  B T H W C
         result[b, t, h, w, :] = z[b, t-W+w, h, :]  (zero for out-of-bounds)
         w=0 is oldest token in window; w=W-1 is most recent.
-        Avoids .flip() and .contiguous() — saves two large tensor copies (~800 MB
-        at large config). torch.compile fuses the permute into downstream ops.
+
+        No .contiguous() — lets torch.compile fuse the permute into downstream
+        elementwise ops rather than materialising a separate ~3 GB copy per layer.
         """
         W  = self.window
-        zt = z.permute(0, 2, 3, 1)                     # B H C T
-        zp = F.pad(zt, (W, 0), value=0.0)              # B H C (T+W)
-        nb = zp.unfold(-1, W, 1)[:, :, :, :T, :]       # B H C T W  (no flip)
-        return nb.permute(0, 3, 1, 4, 2).contiguous() # B T H W C
+        zt = z.permute(0, 2, 3, 1)               # B H C T
+        zp = F.pad(zt, (W, 0), value=0.0)         # B H C (T+W)
+        nb = zp.unfold(-1, W, 1)[:, :, :, :T, :] # B H C T W
+        return nb.permute(0, 3, 1, 4, 2)          # B T H W C  (non-contiguous — compile handles it)
 
     def forward(
         self,
@@ -112,16 +172,41 @@ class MultiHeadCausalTensionLayer(nn.Module):
         q  = self.wq(x).view(B, T, self.num_heads, HD)
         kv = self.wkv(x).view(B, T, self.num_heads, HD * 2)
 
+        # Apply RoPE to Q and K if enabled.
+        # K lives inside kv; split, rotate, re-fuse so _gather_window sees rotated keys.
+        if self.rope is not None:
+            k, v = kv.split(HD, dim=-1)
+            q  = self.rope(q, T)
+            k  = self.rope(k, T)
+            kv = torch.cat([k, v], dim=-1)
+
+        if self.use_triton and x.is_cuda and not return_tensions:
+            # Fused kernel path — never materialises the B×T×H×W×HD tensor.
+            # return_tensions=True falls through to the unfold path (needed for the
+            # diversity loss and tension visualisation).
+            from triton_tension import causal_tension
+            k, v = kv.split(HD, dim=-1)
+            msg = causal_tension(q, k, v, self.window, self.scale)  # B T H HD (float32)
+            # Magnitude normalisation: divide by number of valid window positions.
+            msg = msg / self.valid_count[:T, None, None]             # B T H HD
+            msg = self.dropout(msg)
+            out = self.norm(x + self.wo(msg.reshape(B, T, D)))
+            return out
+
+        # Unfold path (reference, also used when return_tensions=True)
         nb_kv      = self._gather_window(kv, T)       # B T H W 2*HD
         nb_k, nb_v = nb_kv.split(HD, dim=-1)          # B T H W HD each
 
-        # Independent sigmoid per pair — no softmax, no competition
+        # Independent sigmoid per pair — no softmax, no competition.
+        # Mask zeroes out positions where the window overlaps pre-sequence padding.
         tau = torch.sigmoid(
-            (q.unsqueeze(3) * nb_k).sum(-1) / self.scale  # B T H W
-        )
+            (q.unsqueeze(3) * nb_k).sum(-1) / self.scale   # B T H W
+        ) * self.causal_mask[:T].unsqueeze(1)               # B T H W * (T 1 W)
         tau = self.dropout(tau)
 
-        msg = (tau.unsqueeze(-1) * nb_v).sum(3)           # B T H HD
+        msg = (tau.unsqueeze(-1) * nb_v).sum(3)             # B T H HD
+        # Magnitude normalisation: mean over valid positions instead of sum.
+        msg = msg / self.valid_count[:T, None, None]         # B T H HD
         out = self.norm(x + self.wo(msg.reshape(B, T, D)))
 
         if return_tensions:
@@ -179,12 +264,15 @@ class TensionBlock(nn.Module):
         super().__init__()
         self.pre_norm  = RMSNorm(cfg.dim)
         self.tension   = MultiHeadCausalTensionLayer(cfg)
-        self.oscillate = OscillatoryModulation(cfg)
+        self.oscillate = OscillatoryModulation(cfg) if cfg.use_oscillation else None
         self.ffn       = TensionFFN(cfg)
         self.use_ckpt  = cfg.use_grad_checkpoint
 
+    def _apply_osc(self, x: torch.Tensor) -> torch.Tensor:
+        return self.oscillate(x) if self.oscillate is not None else x
+
     def _impl_no_tensions(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ffn(self.oscillate(self.tension(self.pre_norm(x))))
+        return self.ffn(self._apply_osc(self.tension(self.pre_norm(x))))
 
     def _impl(
         self, x: torch.Tensor, return_tensions: bool = False
@@ -192,8 +280,8 @@ class TensionBlock(nn.Module):
         h = self.pre_norm(x)
         if return_tensions:
             h, tau = self.tension(h, return_tensions=True)
-            return self.ffn(self.oscillate(h)), tau
-        return self.ffn(self.oscillate(self.tension(h)))
+            return self.ffn(self._apply_osc(h)), tau
+        return self.ffn(self._apply_osc(self.tension(h)))
 
     def forward(
         self, x: torch.Tensor, return_tensions: bool = False
