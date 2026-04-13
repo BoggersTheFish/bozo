@@ -18,7 +18,7 @@ import sys
 
 import torch
 
-from model import TensionConfig, TensionLM, generate as _generate, show_tensions
+from model import TensionConfig, TensionLM, generate as _generate, generate_anchored as _generate_anchored, show_tensions
 
 
 def get_args():
@@ -32,6 +32,7 @@ def get_args():
     p.add_argument("--temp",        default=0.80,  type=float, help="Sampling temperature (lower = more conservative)")
     p.add_argument("--top_p",       default=0.92,  type=float, help="Nucleus sampling probability")
     p.add_argument("--rep_penalty", default=1.30,  type=float, help="Repetition penalty (1.0 = off)")
+    p.add_argument("--anchor",      action="store_true",       help="Keep prompt tokens permanently in tension window (TS anchored generation)")
     p.add_argument("--show_tension",action="store_true",       help="Show tension field for each prompt")
     p.add_argument("--layer",       default=0,     type=int,   help="Layer to visualise tensions for")
     return p.parse_args()
@@ -65,8 +66,9 @@ def load_model_and_tokenizer(ckpt_path: str):
 
 
 def do_generate(model, tokenizer, prompt: str, args) -> str:
-    enc     = tokenizer.encode(prompt)
-    ids_out = _generate(
+    enc = tokenizer.encode(prompt)
+    fn  = _generate_anchored if args.anchor else _generate
+    ids_out = fn(
         model, enc.ids,
         max_new=args.max_new,
         temp=args.temp,

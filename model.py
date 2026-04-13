@@ -439,6 +439,69 @@ def generate(
     return ids
 
 
+def generate_anchored(
+    model:       TensionLM,
+    input_ids:   list[int],
+    max_new:     int   = 200,
+    temp:        float = 0.8,
+    top_p:       float = 0.92,
+    rep_penalty: float = 1.3,
+) -> list[int]:
+    """
+    Anchored generation — the prompt tokens are permanently held within the
+    model's direct tension window at every generation step.
+
+    Standard generation uses ctx = ids[-max_ctx:], so after W tokens the
+    original prompt falls outside the window and exerts zero constraint.
+    Here, ctx is rebuilt each step as:
+
+        [prompt_ids] + [last (W - len(prompt)) generated tokens]
+
+    The prompt occupies the first positions and the generated tokens fill the
+    remaining window slots.  The model can never lose sight of the original
+    topic constraint because those edges always exist in the tension field.
+
+    Under TS: the prompt tokens are persistent high-tau constraints.
+    Standard generation lets them decay with distance; anchored generation
+    treats them as foundational constraints that do not decay.
+    """
+    model.eval()
+    W          = model.cfg.window
+    prompt_ids = list(input_ids)
+    generated  = []          # generated tokens only
+    all_ids    = list(input_ids)   # full sequence for rep penalty tracking
+
+    # How many recent generated tokens fit alongside the anchor in the window
+    recent_slots = max(1, W - len(prompt_ids))
+
+    for _ in range(max_new):
+        # Always: anchor + most recent generated tokens
+        ctx_ids = prompt_ids + generated[-recent_slots:]
+        ctx     = torch.tensor([ctx_ids], dtype=torch.long)
+        logits  = model(ctx)[0, -1].float()
+
+        # Repetition penalty over full history
+        for tok in set(all_ids[-32:]):
+            if logits[tok] > 0:
+                logits[tok] /= rep_penalty
+            else:
+                logits[tok] *= rep_penalty
+
+        logits = logits / max(temp, 1e-5)
+        probs  = F.softmax(logits, dim=-1)
+        sorted_p, sorted_i = torch.sort(probs, descending=True)
+        cum_p  = torch.cumsum(sorted_p, dim=-1)
+        mask   = (cum_p - sorted_p) < top_p
+        sorted_p[~mask] = 0.0
+        sorted_p /= sorted_p.sum()
+        next_id = sorted_i[torch.multinomial(sorted_p, 1).item()].item()
+
+        generated.append(next_id)
+        all_ids.append(next_id)
+
+    return all_ids
+
+
 # ── Tension Visualiser ────────────────────────────────────────────────────────
 
 def show_tensions(model: TensionLM, tokenizer, text: str, layer: int = 0):
