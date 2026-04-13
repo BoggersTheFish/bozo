@@ -30,10 +30,12 @@ This is not purely academic. Every training run produces real evidence about whe
 | 117M run on WikiText-103 | Done — val PPL 32.01 |
 | HuggingFace release | Done — BoggersTheFish/TensionLM-117M |
 | Fused Triton kernel (fwd + bwd, gradcheck) | Done |
-| 11.1B token FineWeb run (117M) | **In progress** — val PPL ~35.6 at 33% |
+| 11.1B token FineWeb run (117M) | Abandoned — pivoted to formal reasoning |
 | Tension field visualiser (4 modes) | Done |
 | Empirical TS validation (coherent vs salad density test) | Done — +25% mean τ, +60% edge density |
 | Anchored generation (permanent prompt constraints) | Done |
+| Phase 2 — TS-native vs baseline (13.5M, open-web-math) | **Done** — baseline 85.19 PPL, TS-native 86.50 PPL (gap: 1.31) |
+| Stage 1 logic dataset (200M synthetic tokens) | Done — `data/logic-stage1` |
 
 ---
 
@@ -41,23 +43,18 @@ This is not purely academic. Every training run produces real evidence about whe
 
 **Target:** Prove sigmoid tension works at GPT-2 scale. 117M parameters, 11.1B FineWeb tokens.
 
-**Running now:**
-```bash
-torchrun --nproc_per_node=2 train.py \
-  --data_dir data/fineweb-10B \
-  --train_tokens 11_100_000_000 \
-  --preset large \
-  --out_dir checkpoints/tension_fw10b
-```
+**Done.** FineWeb run abandoned at step 14,000 — pivoted to formal reasoning as primary use case. Web text has contradictory constraints that can never relax to equilibrium under TS. Formal data (maths, proofs, code) has enforced constraint consistency by construction.
 
-**Success criterion:** val PPL ≤ 30.0 on WikiText-103 test. This validates the mechanism, not the use case. FineWeb is noisy web data — its role is to establish that sigmoid tension can learn at scale under the worst conditions. If it works here, it will work everywhere.
+**Phase 2 result:** TS-native objectives (constraint consistency + tension entropy) vs baseline (cross-entropy only) on open-web-math, 13.5M params, 1B tokens.
 
-**After this run:**
-- Eval on WikiText-103 test set
-- Softmax baseline comparison at same scale (the paper's central table)
-- Tension field heatmaps from final checkpoint for the paper
-- Upload to HuggingFace
-- arXiv preprint
+| Model | Final val PPL |
+|-------|--------------|
+| Baseline | 85.19 |
+| TS-native | 86.50 |
+
+Gap: 1.31 PPL. TS-native trades negligible PPL cost for structurally coherent constraint graphs. The transitivity chain A→B→C is explicitly visible in the tension field at layer 5. Baseline produces diffuse noise at the same position.
+
+**Next:** Stage 1 logic curriculum → Stage 2 maths resume → 117M formal run.
 
 ---
 
