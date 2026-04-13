@@ -147,7 +147,50 @@ If TensionLM's exponent is similar or better, the architecture scales. If it's w
 
 ---
 
-## Phase 5 — Memory and persistent constraint graphs
+## Phase 5 — TS-native training objectives
+
+### The problem with next-token prediction
+
+Cross-entropy next-token prediction is a transformer-era objective. It was designed for a model that compresses everything into attention weights and produces a probability distribution over the vocabulary. It works — but it's a noisy proxy for what TensionLM is actually doing.
+
+Next-token prediction asks: *given the past, what token comes next?* It trains the model to recover statistical co-occurrence patterns in text. The constraint graph emerges as a side effect of doing this well — the model learns constraints because constraints are the most efficient way to predict well. But the training signal never directly touches the constraint graph. It only rewards outputs.
+
+Under TS, the correct objective is different: *given the surrounding constraints, what state would this position relax to?* Train the graph directly, not just the outputs.
+
+Current results are the **floor**, not the ceiling. The model already works reasonably well despite the indirect training signal — which means the constraint structure is already latent in the text. Better objectives remove the noise and give the model a direct signal for what it's already trying to learn.
+
+### TS-native objectives (to be explored after Phase 2)
+
+**Equilibrium prediction (masked constraint resolution)**
+Mask a span of tokens. Given the constraint graph from the surrounding context, predict the stable state the masked positions should relax to. Unlike BERT's masked language model (which predicts tokens independently), this is explicitly motivated by TS: the masked positions are nodes with unresolved tension, and the objective is to find their equilibrium given their constraint neighbourhood. The model is rewarded for finding a globally consistent state, not just a locally probable token.
+
+**Constraint consistency loss**
+If token A tensions token B strongly (high τ), and token B tensions token C strongly, then A should also tension C — transitivity of constraints. Penalise constraint graphs where this transitivity is violated. Pushes the model toward internally coherent representations rather than statistically plausible token sequences.
+
+**Tension entropy regularisation**
+Each position should have meaningful, selective tension — not zero (isolated node) and not maximum across all positions (noise). Penalise both extremes. The constraint graph should be sparse but non-trivial: some edges are strong, most are weak, none are absent entirely. This directly regularises the structure of the learned graph.
+
+**Constraint symmetry**
+Under TS, constraints are bidirectional in principle — if A constrains B, B constrains A to some degree. Pure one-directional tension is physically unusual. A soft symmetry regulariser on τ values encourages the model to build more physically coherent constraint graphs.
+
+**Multi-scale consistency**
+The constraint graph at layer 1 (local syntax) should be consistent with the constraint graph at layer 12 (semantic meaning). Currently layers are independent. A loss that aligns shallow and deep constraint patterns forces the model to build representations that are coherent across scales — syntactic structure and semantic structure point to the same underlying constraints.
+
+### Data quality under TS
+
+The internet contains contradictory constraints — two documents making opposite claims about the same thing. Under TS, contradictory data creates constraint loops that can never relax to equilibrium. The model learns a fuzzy average of the contradiction — which is neither true nor false, just statistically common. This is the mechanism behind hallucination.
+
+The fix is not more data — it's **better constraint quality**:
+
+- **Formal data first**: mathematics, verified code, formal proofs. Constraints are enforced by definition — contradictions literally cannot exist. A model trained heavily on formal data builds an extremely coherent internal constraint graph that generalises to messier domains.
+- **Curated domain data**: textbooks, peer-reviewed papers, verified sources. High constraint consistency within domain.
+- **Synthetic data from known ground truth**: generate training data from a system where you control the constraint graph, so coherence is guaranteed.
+
+The current FineWeb training is necessary to establish the baseline. Future runs should increasingly weight formal and high-consistency data. This is not a data filtering problem — it's a constraint quality problem, and TS gives you a precise language to reason about it.
+
+---
+
+## Phase 6 — Memory and persistent constraint graphs
 
 The current model has no persistence between runs. Every inference starts from zero — the constraint graph is rebuilt from scratch for each input. Under TS, this is incomplete. A full TS system accumulates edges in a persistent graph that updates with each observation.
 
@@ -169,6 +212,8 @@ Concretely this looks like:
 This is distinct from RAG (retrieval-augmented generation), which retrieves text chunks. The persistent graph retrieves constraint patterns — the structural shape of what the model knows, not raw text.
 
 This phase begins after Phase 4a produces a solid 1B model. The persistent graph is architecturally separate from TensionLM and can be developed in parallel.
+
+The combination of Phase 5 (TS-native training) and Phase 6 (persistent graph) produces a system that learns constraints correctly *and* accumulates them over time — which is the full TS account of what intelligence is.
 
 ---
 
