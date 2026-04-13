@@ -399,6 +399,98 @@ def tension_diversity_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
     return F.relu(math.log(W) - ent.mean()).mean()
 
 
+def constraint_consistency_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
+    """
+    TS-native: constraint transitivity enforcement.
+
+    Under TS, if A tensions B strongly and B tensions C strongly,
+    A should tension C — transitivity of constraints. This loss penalises
+    constraint graphs where this transitivity is violated.
+
+    Concretely: for each token t and each head h, if tau[t, w1] is high
+    (t is strongly constrained by t-w1) and tau[t-w1, w2] is high
+    (t-w1 is strongly constrained by t-w1-w2), then tau[t, w1+w2] should
+    also be elevated. Penalise the gap.
+
+    This pushes the model toward building constraint graphs that are
+    internally coherent rather than just statistically plausible.
+    """
+    if not all_tensions:
+        return torch.tensor(0.0)
+
+    total = torch.tensor(0.0, device=all_tensions[0].device)
+    count = 0
+
+    for tau in all_tensions:          # tau: B T H W
+        B, T, H, W = tau.shape
+        if W < 2:
+            continue
+
+        # For each pair of adjacent window offsets (w1, w2) where w1+w2 < W:
+        # tau[t, w1] * tau[t-w1, w2] should predict tau[t, w1+w2]
+        # Use w1=1, w2=1 → w_combined=2 as the cheapest check
+        for w1 in range(1, min(W // 2, 4)):       # keep cheap: max 3 pairs
+            for w2 in range(1, min(W // 2, 4)):
+                w_combined = w1 + w2
+                if w_combined >= W:
+                    break
+
+                # t must have at least w_combined valid predecessors
+                t_start = w_combined
+                if t_start >= T:
+                    break
+
+                # expected transitivity: product of the two legs
+                tau_leg1 = tau[:, t_start:, :, w1 - 1]          # B T' H
+                tau_leg2 = tau[:, t_start - w1: T - w1, :, w2 - 1]  # B T' H
+                tau_expected = tau_leg1 * tau_leg2               # B T' H
+
+                # actual combined tension
+                tau_actual = tau[:, t_start:, :, w_combined - 1] # B T' H
+
+                # penalise when actual is lower than expected (broken transitivity)
+                total += F.relu(tau_expected - tau_actual).mean()
+                count += 1
+
+    return total / max(count, 1)
+
+
+def tension_entropy_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
+    """
+    TS-native: tension entropy regularisation.
+
+    Under TS, each node should have meaningful, selective tension —
+    not zero (isolated, no constraints) and not saturated everywhere (noise).
+    The constraint graph should be sparse but non-trivial.
+
+    Penalises both extremes:
+      - Near-zero mean tau per position (isolated node, no constraints active)
+      - Near-uniform high tau across the full window (undifferentiated noise)
+
+    This directly regularises the structure of the learned constraint graph,
+    pushing toward the selective, sparse-but-non-trivial regime that TS
+    predicts a well-formed constraint graph should occupy.
+    """
+    if not all_tensions:
+        return torch.tensor(0.0)
+
+    total = torch.tensor(0.0, device=all_tensions[0].device)
+
+    for tau in all_tensions:      # B T H W
+        # Mean tau per (token, head) over the valid window
+        mean_tau = tau.mean(-1)   # B T H
+
+        # Penalise isolation: mean tau too close to zero
+        isolation_penalty = F.relu(0.05 - mean_tau).mean()
+
+        # Penalise saturation: mean tau too close to 1
+        saturation_penalty = F.relu(mean_tau - 0.80).mean()
+
+        total += isolation_penalty + saturation_penalty
+
+    return total / len(all_tensions)
+
+
 # ── Generation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()

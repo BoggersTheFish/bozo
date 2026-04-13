@@ -44,6 +44,7 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from model import (
     TensionConfig, TensionLM,
     manifold_closure_loss, tension_diversity_loss,
+    constraint_consistency_loss, tension_entropy_loss,
 )
 
 
@@ -115,8 +116,13 @@ def get_args():
     p.add_argument("--weight_decay",  default=0.10, type=float)
     p.add_argument("--clip_grad",     default=1.0,  type=float)
     # Aux losses
-    p.add_argument("--w_closure",   default=0.05, type=float)
-    p.add_argument("--w_diversity", default=0.02, type=float)
+    p.add_argument("--w_closure",      default=0.05, type=float)
+    p.add_argument("--w_diversity",    default=0.02, type=float)
+    # TS-native losses
+    p.add_argument("--w_consistency",  default=0.0,  type=float,
+                   help="Constraint consistency loss weight (TS-native, 0=off)")
+    p.add_argument("--w_entropy",      default=0.0,  type=float,
+                   help="Tension entropy regularisation weight (TS-native, 0=off)")
     # I/O
     p.add_argument("--out_dir",    default="checkpoints")
     p.add_argument("--resume",     action="store_true")
@@ -563,19 +569,23 @@ def train(args):
             with (amp_ctx if amp_ctx else contextlib.nullcontext()):
                 if aux_enabled:
                     logits, hidden, tensions = model(inputs, return_all=True)
-                    loss_ce  = criterion(
+                    loss_ce   = criterion(
                         logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
-                    loss_mcl = manifold_closure_loss(hidden)
-                    loss_div = tension_diversity_loss(tensions)
-                    loss     = (loss_ce
-                                + args.w_closure   * loss_mcl
-                                + args.w_diversity * loss_div)
+                    loss_mcl  = manifold_closure_loss(hidden)
+                    loss_div  = tension_diversity_loss(tensions)
+                    loss_cons = constraint_consistency_loss(tensions)
+                    loss_ent  = tension_entropy_loss(tensions)
+                    loss      = (loss_ce
+                                 + args.w_closure      * loss_mcl
+                                 + args.w_diversity    * loss_div
+                                 + args.w_consistency  * loss_cons
+                                 + args.w_entropy      * loss_ent)
                 else:
                     logits   = model(inputs)
                     loss_ce  = criterion(
                         logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
                     loss     = loss_ce
-                    loss_mcl = loss_div = torch.tensor(0.0)
+                    loss_mcl = loss_div = loss_cons = loss_ent = torch.tensor(0.0)
 
             (loss / args.grad_accum).backward()
             raw_step    += 1
@@ -598,10 +608,13 @@ def train(args):
                 ppl     = math.exp(min(loss_ce.item(), 20))
                 sps     = steps_so_far / max(elapsed, 1)
                 eta_h   = (total_steps - step) / max(sps * 3600, 1)
+                cons_str = f" | cons {loss_cons.item():.3f} | ent {loss_ent.item():.3f}" \
+                           if (args.w_consistency > 0 or args.w_entropy > 0) else ""
                 print(
                     f"ep {epoch:2d} | step {step:6d}/{total_steps} | "
                     f"loss {loss.item():.4f} | ppl {ppl:7.1f} | "
-                    f"cl {loss_mcl.item():.3f} | div {loss_div.item():.3f} | "
+                    f"cl {loss_mcl.item():.3f} | div {loss_div.item():.3f}"
+                    f"{cons_str} | "
                     f"lr {lr:.1e} | tok {tokens_seen/1e9:.2f}B | ETA {eta_h:.1f}h"
                 )
                 if csv_file:
