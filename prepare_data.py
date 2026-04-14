@@ -51,7 +51,7 @@ SHARD_SIZE_DEFAULT = 100_000_000  # 100M tokens ≈ 200 MB as uint16
 def get_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--dataset", required=True,
-                   choices=["fineweb-10B", "fineweb-100B",
+                   choices=["fineweb-10B", "fineweb-100B", "fineweb-edu",
                             "wikitext-2-raw-v1", "wikitext-103-raw-v1"],
                    help="Dataset to tokenise")
     p.add_argument("--out_dir",         required=True,
@@ -67,6 +67,8 @@ def get_args():
     p.add_argument("--val_shards",      default=1, type=int,
                    help="Number of shards to hold out for validation (FineWeb only — "
                         "wikitext uses its own validation split)")
+    p.add_argument("--max_tokens",      default=None, type=int,
+                   help="Stop after writing this many tokens total (useful for partial slices)")
     return p.parse_args()
 
 
@@ -85,6 +87,12 @@ def stream_docs(dataset: str):
     elif dataset == "fineweb-100B":
         ds = load_dataset("HuggingFaceFW/fineweb", name="sample-100BT",
                           streaming=True, split="train", trust_remote_code=True)
+        for doc in ds:
+            yield doc["text"], "train"
+
+    elif dataset == "fineweb-edu":
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                          streaming=True, split="train")
         for doc in ds:
             yield doc["text"], "train"
 
@@ -180,6 +188,8 @@ def main():
         batch_splits.clear()
 
     for doc_i, (text, split) in enumerate(stream_docs(args.dataset)):
+        if args.max_tokens and total_tokens >= args.max_tokens:
+            break
         batch_texts.append(text)
         batch_splits.append(split)
 
@@ -196,6 +206,8 @@ def main():
                 elapsed = time.time() - t0
                 print(f"  {meta['path'].split('/')[-1]}  "
                       f"total {total_tokens/1e9:.2f}B tokens  ({elapsed:.0f}s)")
+                if args.max_tokens and total_tokens >= args.max_tokens:
+                    break
 
     flush_encode_batch()  # drain the final partial batch
 
@@ -208,7 +220,7 @@ def main():
             idxs[sp] += 1
 
     # FineWeb has no built-in val split — promote last N train shards to val
-    if args.dataset.startswith("fineweb"):
+    if args.dataset.startswith("fineweb") or args.dataset == "fineweb-edu":
         train_shards = [s for s in shards if s["split"] == "train"]
         for meta in train_shards[-args.val_shards:]:
             old = Path(meta["path"])

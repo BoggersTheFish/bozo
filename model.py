@@ -420,12 +420,21 @@ def tension_diversity_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
     """
     if not all_tensions:
         return torch.tensor(0.0)
-    # Stack layers → single fused kernel instead of L sequential kernels
-    tau  = torch.stack(all_tensions)              # L B T H W
-    W    = tau.shape[-1]
-    p    = tau / (tau.sum(-1, keepdim=True) + 1e-8)
-    ent  = -(p * torch.log(p + 1e-8)).sum(-1)     # L B T H
-    return F.relu(math.log(W) - ent.mean()).mean()
+    # Only stack layers with the same (local) window — global layers have a
+    # different W and can't be stacked together. Process each window-size group.
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for t in all_tensions:
+        groups[t.shape[-1]].append(t)
+    total = torch.tensor(0.0, device=all_tensions[0].device)
+    n = 0
+    for W, tensors in groups.items():
+        tau = torch.stack(tensors)                         # L B T H W
+        p   = tau / (tau.sum(-1, keepdim=True) + 1e-8)
+        ent = -(p * torch.log(p + 1e-8)).sum(-1)           # L B T H
+        total += F.relu(math.log(W) - ent.mean()).mean()
+        n += 1
+    return total / max(n, 1)
 
 
 def constraint_consistency_loss(all_tensions: list[torch.Tensor]) -> torch.Tensor:
