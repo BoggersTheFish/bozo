@@ -205,8 +205,12 @@ class MultiHeadCausalTensionLayer(nn.Module):
         tau = self.dropout(tau)
 
         msg = (tau.unsqueeze(-1) * nb_v).sum(3)             # B T H HD
-        # Magnitude normalisation: mean over valid positions instead of sum.
-        msg = msg / self.valid_count[:T, None, None]         # B T H HD
+        # Tau-mass normalisation: divide by total constraint mass (Σ τ) rather than
+        # valid position count.  TS-correct: a node's output should be proportional
+        # to the total constraint acting on it, not the count of positions that could
+        # have constrained it.  Clamp at 1e-6 to avoid div-by-zero on early tokens.
+        tau_mass = tau.sum(-1).clamp(min=1e-6)               # B T H
+        msg = msg / tau_mass.unsqueeze(-1)                   # B T H HD
         out = self.norm(x + self.wo(msg.reshape(B, T, D)))
 
         if return_tensions:

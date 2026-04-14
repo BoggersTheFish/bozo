@@ -150,6 +150,7 @@ def get_args():
             dim=768, num_layers=12, num_heads=12, window=64, ffn_mult=3,
             max_seq_len=1024, seq_len=512, batch_size=8, grad_accum=8,
             vocab_size=32768, dataset="wikitext-103-raw-v1", warmup_steps=2000,
+            rope=True, no_osc=True, triton=True,
         )
 
     return p.parse_args()
