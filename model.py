@@ -41,6 +41,7 @@ class TensionConfig:
     use_oscillation:     bool  = True   # set False to ablate OscillatoryModulation
     use_rope:            bool  = False  # Rotary Position Embeddings (replaces learned pos + OscillatoryModulation)
     use_triton:          bool  = False  # Fused Triton kernel for tension op (requires CUDA)
+    global_every:        int   = 0     # interleaved global tension layer every N layers (0=off)
 
     @property
     def head_dim(self) -> int:
@@ -106,14 +107,19 @@ class MultiHeadCausalTensionLayer(nn.Module):
     Tension replaces softmax with independent sigmoid scores, so the total
     pull on token t across all window positions and heads is unbounded —
     the model learns which relationships matter without forcing competition.
+
+    When global=True the window covers the full sequence (used for interleaved
+    global layers). This gives long-range constraint propagation at O(T²) cost
+    for that layer only — all other layers remain O(T×W).
     """
-    def __init__(self, cfg: TensionConfig):
+    def __init__(self, cfg: TensionConfig, global_layer: bool = False):
         super().__init__()
-        self.window     = cfg.window
+        self.window     = cfg.max_seq_len if global_layer else cfg.window
+        self.global_layer = global_layer
         self.num_heads  = cfg.num_heads
         self.head_dim   = cfg.head_dim
         self.scale      = math.sqrt(self.head_dim)
-        self.use_triton = cfg.use_triton
+        self.use_triton = cfg.use_triton and not global_layer  # triton kernel is local only
         D               = cfg.dim
 
         self.wq      = nn.Linear(D, D, bias=False)
@@ -128,20 +134,19 @@ class MultiHeadCausalTensionLayer(nn.Module):
         # Precomputed causal validity mask: (t, w) is valid when t + w >= W.
         # The Triton kernel handles this via a bounds check and doesn't need the buffer.
         # The unfold path still uses it.
+        W_eff = self.window   # actual window for this layer (local W or max_seq_len for global)
         t_idx = torch.arange(cfg.max_seq_len).unsqueeze(1)  # S 1
-        w_idx = torch.arange(cfg.window).unsqueeze(0)        # 1 W
+        w_idx = torch.arange(W_eff).unsqueeze(0)             # 1 W_eff
         self.register_buffer(
             "causal_mask",
-            (t_idx + w_idx >= cfg.window).float(),           # S W
+            (t_idx + w_idx >= W_eff).float(),                # S W_eff
             persistent=False,
         )
 
-        # Valid-position count per query token: min(t, W).
-        # Used for magnitude normalisation — divides msg by the number of positions
-        # actually contributing, keeping output scale stable as W grows.
+        # Valid-position count per query token.
         self.register_buffer(
             "valid_count",
-            (t_idx + w_idx >= cfg.window).float().sum(-1).clamp(min=1),  # S
+            (t_idx + w_idx >= W_eff).float().sum(-1).clamp(min=1),  # S
             persistent=False,
         )
 
@@ -202,7 +207,9 @@ class MultiHeadCausalTensionLayer(nn.Module):
         tau = torch.sigmoid(
             (q.unsqueeze(3) * nb_k).sum(-1) / self.scale   # B T H W
         ) * self.causal_mask[:T].unsqueeze(1)               # B T H W * (T 1 W)
-        tau = self.dropout(tau)
+        # No dropout on tau — randomly zeroing constraint edges corrupts the graph
+        # structure that the TS-native losses are trying to build.
+        # Dropout is applied to the projected output instead (below).
 
         msg = (tau.unsqueeze(-1) * nb_v).sum(3)             # B T H HD
         # Tau-mass normalisation: divide by total constraint mass (Σ τ) rather than
@@ -211,7 +218,7 @@ class MultiHeadCausalTensionLayer(nn.Module):
         # have constrained it.  Clamp at 1e-6 to avoid div-by-zero on early tokens.
         tau_mass = tau.sum(-1).clamp(min=1e-6)               # B T H
         msg = msg / tau_mass.unsqueeze(-1)                   # B T H HD
-        out = self.norm(x + self.wo(msg.reshape(B, T, D)))
+        out = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
 
         if return_tensions:
             return out, tau
@@ -264,13 +271,14 @@ class TensionFFN(nn.Module):
 # ── Tension Block ─────────────────────────────────────────────────────────────
 
 class TensionBlock(nn.Module):
-    def __init__(self, cfg: TensionConfig):
+    def __init__(self, cfg: TensionConfig, global_layer: bool = False):
         super().__init__()
         self.pre_norm  = RMSNorm(cfg.dim)
-        self.tension   = MultiHeadCausalTensionLayer(cfg)
+        self.tension   = MultiHeadCausalTensionLayer(cfg, global_layer=global_layer)
         self.oscillate = OscillatoryModulation(cfg) if cfg.use_oscillation else None
         self.ffn       = TensionFFN(cfg)
         self.use_ckpt  = cfg.use_grad_checkpoint
+        self.global_layer = global_layer
 
     def _apply_osc(self, x: torch.Tensor) -> torch.Tensor:
         return self.oscillate(x) if self.oscillate is not None else x
@@ -309,34 +317,48 @@ class TensionLM(nn.Module):
     def __init__(self, cfg: TensionConfig):
         super().__init__()
         self.cfg = cfg
-        self.embedding     = nn.Embedding(cfg.vocab_size, cfg.dim)
-        self.pos_embedding = nn.Embedding(cfg.max_seq_len, cfg.dim)
-        self.emb_drop      = nn.Dropout(cfg.dropout)
-        self.blocks        = nn.ModuleList(
-            [TensionBlock(cfg) for _ in range(cfg.num_layers)]
-        )
+        self.embedding  = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self.emb_drop   = nn.Dropout(cfg.dropout)
+
+        # Learned positional embeddings only when RoPE is off.
+        # RoPE encodes position implicitly in Q/K — adding learned pos embeddings
+        # on top is redundant and wastes parameters.
+        if not cfg.use_rope:
+            self.pos_embedding = nn.Embedding(cfg.max_seq_len, cfg.dim)
+            pos = torch.arange(cfg.max_seq_len).unsqueeze(0)  # 1 S
+            self.register_buffer("pos_buf", pos, persistent=False)
+        else:
+            self.pos_embedding = None
+
+        # Build blocks — interleave global layers every cfg.global_every layers.
+        # global_every=0 means all local (standard behaviour).
+        # e.g. global_every=4 with 12 layers → global at layers 3, 7, 11.
+        blocks = []
+        for i in range(cfg.num_layers):
+            is_global = cfg.global_every > 0 and ((i + 1) % cfg.global_every == 0)
+            blocks.append(TensionBlock(cfg, global_layer=is_global))
+        self.blocks = nn.ModuleList(blocks)
+
         self.final_norm = RMSNorm(cfg.dim)
         self.lm_head    = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embedding.weight  # weight tying
-
-        # Non-persistent buffer — avoids torch.arange on every forward pass.
-        pos = torch.arange(cfg.max_seq_len).unsqueeze(0)  # 1 S
-        self.register_buffer("pos_buf", pos, persistent=False)
 
         self._init_weights()
 
     def _init_weights(self):
         std   = 0.02
         depth = self.cfg.num_layers
-        nn.init.normal_(self.embedding.weight,     std=std)
-        nn.init.normal_(self.pos_embedding.weight, std=std)
+        nn.init.normal_(self.embedding.weight, std=std)
+        if self.pos_embedding is not None:
+            nn.init.normal_(self.pos_embedding.weight, std=std)
         for name, m in self.named_modules():
             if isinstance(m, nn.Linear):
-                # Scale output projections by depth (GPT-2 init, stabilises deep nets)
+                # Scale ALL projections by depth for stability in deep nets.
+                # Output projections (wo, proj) scaled more aggressively.
                 if name.endswith(("wo", "proj")):
                     nn.init.normal_(m.weight, std=std / math.sqrt(2 * depth))
                 else:
-                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.normal_(m.weight, std=std / math.sqrt(depth))
 
     def forward(
         self,
@@ -353,7 +375,10 @@ class TensionLM(nn.Module):
         assert T <= self.cfg.max_seq_len, \
             f"Sequence length {T} exceeds max_seq_len {self.cfg.max_seq_len}"
 
-        x   = self.emb_drop(self.embedding(input_ids) + self.pos_embedding(self.pos_buf[:, :T]))
+        x = self.embedding(input_ids)
+        if self.pos_embedding is not None:
+            x = x + self.pos_embedding(self.pos_buf[:, :T])
+        x = self.emb_drop(x)
 
         all_tensions = []
         for block in self.blocks:
@@ -411,13 +436,10 @@ def constraint_consistency_loss(all_tensions: list[torch.Tensor]) -> torch.Tenso
     A should tension C — transitivity of constraints. This loss penalises
     constraint graphs where this transitivity is violated.
 
-    Concretely: for each token t and each head h, if tau[t, w1] is high
-    (t is strongly constrained by t-w1) and tau[t-w1, w2] is high
-    (t-w1 is strongly constrained by t-w1-w2), then tau[t, w1+w2] should
-    also be elevated. Penalise the gap.
-
-    This pushes the model toward building constraint graphs that are
-    internally coherent rather than just statistically plausible.
+    Vectorised implementation: for each layer, compute all valid (w1, w2) pairs
+    simultaneously using tensor slicing rather than Python loops over w1/w2.
+    Checks w1 ∈ [1, max_w], w2 = 1 (cheapest non-trivial transitivity check):
+        tau[t, w1] * tau[t-w1, 1]  should ≤  tau[t, w1+1]
     """
     if not all_tensions:
         return torch.tensor(0.0)
@@ -425,36 +447,29 @@ def constraint_consistency_loss(all_tensions: list[torch.Tensor]) -> torch.Tenso
     total = torch.tensor(0.0, device=all_tensions[0].device)
     count = 0
 
-    for tau in all_tensions:          # tau: B T H W
+    for tau in all_tensions:   # tau: B T H W
         B, T, H, W = tau.shape
-        if W < 2:
+        if W < 3 or T < 3:
             continue
 
-        # For each pair of adjacent window offsets (w1, w2) where w1+w2 < W:
-        # tau[t, w1] * tau[t-w1, w2] should predict tau[t, w1+w2]
-        # Use w1=1, w2=1 → w_combined=2 as the cheapest check
-        for w1 in range(1, min(W // 2, 4)):       # keep cheap: max 3 pairs
-            for w2 in range(1, min(W // 2, 4)):
-                w_combined = w1 + w2
-                if w_combined >= W:
-                    break
+        max_w1 = min(W - 2, 4)   # keep cheap
 
-                # t must have at least w_combined valid predecessors
-                t_start = w_combined
-                if t_start >= T:
-                    break
+        # tau_leg1: B T' H max_w1  (w1 = 1..max_w1, for t starting at w1+1)
+        # tau_leg2: B T' H         (w2 = 1, i.e. tau[t-w1, 0])
+        # tau_comb: B T' H max_w1  (tau[t, w1+1])
 
-                # expected transitivity: product of the two legs
-                tau_leg1 = tau[:, t_start:, :, w1 - 1]          # B T' H
-                tau_leg2 = tau[:, t_start - w1: T - w1, :, w2 - 1]  # B T' H
-                tau_expected = tau_leg1 * tau_leg2               # B T' H
+        for w1 in range(1, max_w1 + 1):
+            t_start = w1 + 1
+            if t_start >= T:
+                break
 
-                # actual combined tension
-                tau_actual = tau[:, t_start:, :, w_combined - 1] # B T' H
+            leg1     = tau[:, t_start:, :, w1 - 1]           # B T' H
+            leg2     = tau[:, t_start - w1: T - w1, :, 0]    # B T' H  (w2=1)
+            expected = leg1 * leg2                             # B T' H
 
-                # penalise when actual is lower than expected (broken transitivity)
-                total += F.relu(tau_expected - tau_actual).mean()
-                count += 1
+            combined = tau[:, t_start:, :, w1]                # B T' H  (w1+1 offset)
+            total   += F.relu(expected - combined).mean()
+            count   += 1
 
     return total / max(count, 1)
 

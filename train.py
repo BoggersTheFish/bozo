@@ -105,6 +105,9 @@ def get_args():
                    help="Use Rotary Position Embeddings (replaces learned pos + OscillatoryModulation)")
     p.add_argument("--triton",      action="store_true",
                    help="Use fused Triton kernel for tension op (CUDA only)")
+    p.add_argument("--global_every", default=0, type=int,
+                   help="Interleaved global tension layer every N layers (0=off). "
+                        "e.g. --global_every 4 with 12 layers → global at layers 3,7,11")
     # Training
     p.add_argument("--seq_len",       default=64,   type=int)
     p.add_argument("--batch_size",    default=32,   type=int)
@@ -150,7 +153,7 @@ def get_args():
             dim=768, num_layers=12, num_heads=12, window=64, ffn_mult=3,
             max_seq_len=1024, seq_len=512, batch_size=8, grad_accum=8,
             vocab_size=32768, dataset="wikitext-103-raw-v1", warmup_steps=2000,
-            rope=True, no_osc=True, triton=True,
+            rope=True, no_osc=True, triton=True, global_every=4,
         )
 
     return p.parse_args()
@@ -447,6 +450,7 @@ def train(args):
         use_oscillation     = not args.no_osc,
         use_rope            = args.rope,
         use_triton          = args.triton,
+        global_every        = args.global_every,
     )
     if args.model == "transformer":
         from baseline import TransformerLM
