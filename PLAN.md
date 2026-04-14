@@ -36,6 +36,9 @@ This is not purely academic. Every training run produces real evidence about whe
 | Anchored generation (permanent prompt constraints) | Done |
 | Phase 2 — TS-native vs baseline (13.5M, open-web-math) | **Done** — baseline 85.19 PPL, TS-native 86.50 PPL (gap: 1.31) |
 | Stage 1 logic dataset (200M synthetic tokens) | Done — `data/logic-stage1` |
+| Curriculum training — logic → language → maths (13.5M) | Done — 4× better first-contact PPL vs cold start |
+| Curriculum transfer LR fix + closure loss reduction | Done — `--transfer_lr`, `w_closure` default 0.01 |
+| TS-native Phase 2 model on HuggingFace | Done — BoggersTheFish/TensionLM-Phase2-TSNative |
 
 ---
 

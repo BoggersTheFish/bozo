@@ -111,12 +111,15 @@ def get_args():
     p.add_argument("--grad_accum",    default=2,    type=int)
     p.add_argument("--lr",            default=3e-4, type=float)
     p.add_argument("--min_lr",        default=3e-5, type=float)
+    p.add_argument("--transfer_lr",   default=None, type=float,
+                   help="Peak LR override for curriculum transfer (use with --resume). "
+                        "Lower than --lr to avoid overwriting prior knowledge. Default: lr/3")
     p.add_argument("--warmup_steps",  default=200,  type=int)
     p.add_argument("--epochs",        default=10,   type=int)
     p.add_argument("--weight_decay",  default=0.10, type=float)
     p.add_argument("--clip_grad",     default=1.0,  type=float)
     # Aux losses
-    p.add_argument("--w_closure",      default=0.05, type=float)
+    p.add_argument("--w_closure",      default=0.01, type=float)
     p.add_argument("--w_diversity",    default=0.02, type=float)
     # TS-native losses
     p.add_argument("--w_consistency",  default=0.0,  type=float,
@@ -521,13 +524,21 @@ def train(args):
         if os.path.exists(ckpt_file):
             ckpt = load_checkpoint(ckpt_file, device)
             _unwrap(model).load_state_dict(ckpt["model"])
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            start_step  = ckpt["step"]
-            tokens_seen = start_step * tokens_per_step
+            # Do NOT restore optimizer state on curriculum transfer — we want a
+            # fresh optimiser so the new LR schedule takes effect cleanly.
+            start_step  = 0   # reset step counter so LR schedule runs from scratch
+            tokens_seen = 0
+            # Apply transfer LR: default to lr/3 if not explicitly set
+            if args.transfer_lr is not None:
+                args.lr     = args.transfer_lr
+                args.min_lr = args.transfer_lr / 10
+            else:
+                args.lr     = args.lr / 3
+                args.min_lr = args.min_lr / 3
             if is_main:
-                print(f"Resumed from step {start_step}  "
-                      f"(prev val ppl: {ckpt.get('val_ppl', '?'):.2f})")
+                print(f"Curriculum transfer from step {ckpt['step']}  "
+                      f"(prev val ppl: {ckpt.get('val_ppl', '?'):.2f})  "
+                      f"peak LR → {args.lr:.2e}")
         elif is_main:
             print("No checkpoint found — starting fresh.")
 

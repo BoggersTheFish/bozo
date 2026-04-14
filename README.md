@@ -83,6 +83,28 @@ The full transitivity chain A→B→C is explicitly encoded as active simultaneo
 
 This difference is the entire point of TS-native objectives — the model learns to build constraint graphs, not just predict statistically likely tokens.
 
+### Curriculum training — logic → language → maths (13.5M)
+
+TS predicts that coherent data builds coherent constraint graphs. The correct training order is therefore: teach inference structure first, then vocabulary, then formal notation.
+
+| Stage | Data | Tokens | Final val PPL |
+|-------|------|--------|--------------|
+| 1 — Logic | Synthetic inference (TS-native) | 200M | **1.51** |
+| 2 — Language | WikiText-103 | 100M | **196** |
+| 3 — Maths | open-web-math | 200M | **573** |
+
+**First-contact PPL on maths** (first val checkpoint after switching to maths data):
+
+| Training history | First-contact maths val PPL |
+|-----------------|----------------------------|
+| Cold start (Phase 2) | ~2293 |
+| Logic only | ~1076 |
+| Logic + language | **~582** |
+
+4× better first contact than cold start — the curriculum model arrives at maths with inference structure and vocabulary already in place, so it only has to learn formal notation rather than everything at once.
+
+The curriculum model at PPL 573 produces better proof structure than the cold-start model at PPL 85 — the constraint graph is more coherent even at higher perplexity. Reasoning quality ≠ next-token PPL on web text.
+
 ---
 
 ## What the tension field actually shows
