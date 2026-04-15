@@ -1,0 +1,125 @@
+{
+  "dataset": "logic-stage1",
+  "description": "Synthetic pure logical inference dataset \u2014 TS stage 1 curriculum",
+  "vocab_size": 16384,
+  "tokenizer": "data/tokenizer.json",
+  "total_tokens": 200000000,
+  "train_tokens": 190000000,
+  "val_tokens": 10000000,
+  "shards": [
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0000.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0001.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0002.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0003.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0004.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0005.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0006.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0007.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0008.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0009.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0010.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0011.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0012.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0013.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0014.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0015.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0016.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0017.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "train",
+      "path": "data/logic-stage1/train_0018.bin",
+      "tokens": 10000000
+    },
+    {
+      "split": "val",
+      "path": "data/logic-stage1/val_0019.bin",
+      "tokens": 10000000
+    }
+  ],
+  "generator_types": [
+    "modus_ponens",
+    "modus_tollens",
+    "transitivity_chain",
+    "chain_with_assertion",
+    "proof_by_contradiction",
+    "conjunction",
+    "disjunction",
+    "contradiction_detection",
+    "ts_independence",
+    "constraint_propagation",
+    "biconditional",
+    "hypothetical_syllogism_extended"
+  ]
+}

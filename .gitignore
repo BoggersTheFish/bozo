@@ -17,3 +17,7 @@ env/
 checkpoints/
 logs/
 results/
+data/**/*.bin
+data/open-web-math/
+data/fineweb*/
+*.png

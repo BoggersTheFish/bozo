@@ -76,7 +76,7 @@ def get_args():
     )
     # Model
     p.add_argument("--model",   default="tension", choices=["tension", "transformer"])
-    p.add_argument("--preset",  default=None, choices=["small", "medium", "large"])
+    p.add_argument("--preset",  default=None, choices=["small", "medium", "large", "diagnostic", "350m"])
     # Data — small corpus (in-memory)
     p.add_argument("--text_file",  default=None)
     p.add_argument("--dataset",    default="wikitext-2-raw-v1",
@@ -165,6 +165,28 @@ def get_args():
             max_seq_len=1024, seq_len=512, batch_size=8, grad_accum=8,
             vocab_size=32768, dataset="wikitext-103-raw-v1", warmup_steps=2000,
             rope=True, no_osc=True, triton=True, global_every=4,
+        )
+    elif pre.preset == "diagnostic":
+        # ~50M params. For inspecting tension heads on logic data before the full run.
+        # Triton off so return_tensions always uses the readable unfold path.
+        # Full aux losses on — we want to see whether constraint structure forms.
+        p.set_defaults(
+            dim=512, num_layers=12, num_heads=8, window=64, ffn_mult=3,
+            max_seq_len=512, seq_len=256, batch_size=16, grad_accum=4,
+            vocab_size=16384, warmup_steps=500,
+            rope=True, no_osc=True, triton=False, global_every=4,
+            w_consistency=0.1, w_entropy=0.05, w_diversity=0.02, w_closure=0.01,
+        )
+    elif pre.preset == "350m":
+        # ~338M params. The production model.
+        # window=256: proofs regularly require attending back 200+ tokens.
+        # global_every=3: long-range passes every 3 blocks without O(T²) everywhere.
+        p.set_defaults(
+            dim=1024, num_layers=24, num_heads=16, window=256, ffn_mult=3,
+            max_seq_len=2048, seq_len=1024, batch_size=4, grad_accum=16,
+            vocab_size=16384, warmup_steps=2000,
+            rope=True, no_osc=True, triton=True, global_every=3,
+            w_consistency=0.05, w_entropy=0.02, w_diversity=0.02, w_closure=0.01,
         )
 
     return p.parse_args()
