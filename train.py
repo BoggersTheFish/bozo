@@ -88,8 +88,17 @@ def get_args():
     # Token budget (overrides --epochs when set)
     p.add_argument("--train_tokens", default=None, type=int,
                    help="Total tokens to train on. Overrides --epochs.")
+    # Logic mixing — catastrophic forgetting prevention
+    p.add_argument("--logic_mix", default=0.0, type=float,
+                   help="Fraction of each batch drawn from logic stage data (0=off). "
+                        "e.g. --logic_mix 0.1 keeps 10%% logic data in stage 3 "
+                        "to prevent catastrophic forgetting of constraint structure.")
+    p.add_argument("--logic_dir", default=None,
+                   help="Path to logic stage data dir (required when --logic_mix > 0)")
     # Tokeniser
-    p.add_argument("--vocab_size",  default=2048,  type=int)
+    p.add_argument("--vocab_size",  default=2048,  type=int,
+                   help="Vocabulary size. Common values: 2048 (small), 32768 (large preset), "
+                        "50257 (GPT-2 tokenizer compatible).")
     # Architecture
     p.add_argument("--dim",         default=128,   type=int)
     p.add_argument("--num_layers",  default=4,     type=int)
@@ -149,6 +158,8 @@ def get_args():
             max_seq_len=512, seq_len=256, batch_size=16,
         )
     elif pre.preset == "large":
+        # vocab_size=32768 is the default for the large preset.
+        # Use --vocab_size 50257 for GPT-2 tokenizer compatibility (requires retraining tokenizer).
         p.set_defaults(
             dim=768, num_layers=12, num_heads=12, window=64, ffn_mult=3,
             max_seq_len=1024, seq_len=512, batch_size=8, grad_accum=8,
@@ -228,6 +239,44 @@ class ShardedTokenDataset(Dataset):
         x     = torch.from_numpy(chunk[:-1])
         y     = torch.from_numpy(chunk[1:])
         return x, y
+
+
+# ── Mixed DataLoader (catastrophic forgetting prevention) ────────────────────
+
+class MixedDataLoader:
+    """
+    Interleaves a primary dataloader with a secondary (logic-stage) loader at a
+    specified ratio. When logic_frac=0 it is identical to iterating primary directly.
+
+    On each batch there is a logic_frac probability of yielding a batch from the
+    secondary loader instead of the primary. The secondary loader cycles
+    indefinitely — it restarts automatically when exhausted.
+    """
+    def __init__(self, primary: DataLoader, secondary: DataLoader, logic_frac: float):
+        self.primary        = primary
+        self.secondary      = secondary
+        self.logic_frac     = logic_frac
+        self._secondary_iter = None
+
+    def __len__(self):
+        return len(self.primary)
+
+    def _next_secondary(self):
+        if self._secondary_iter is None:
+            self._secondary_iter = iter(self.secondary)
+        try:
+            return next(self._secondary_iter)
+        except StopIteration:
+            self._secondary_iter = iter(self.secondary)
+            return next(self._secondary_iter)
+
+    def __iter__(self):
+        import random
+        for batch in self.primary:
+            if self.logic_frac > 0 and random.random() < self.logic_frac:
+                yield self._next_secondary()
+            else:
+                yield batch
 
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
@@ -416,7 +465,7 @@ def train(args):
         val_ds   = TokenDataset(val_ids, args.seq_len, stride=args.seq_len // 2)
 
     # ── DataLoaders ──
-    n_workers    = min(4, multiprocessing.cpu_count() // 2) if device.type == "cuda" else 0
+    n_workers = min(12, multiprocessing.cpu_count() - 2) if device.type == "cuda" else 0
     train_sampler = DistributedSampler(
         train_ds, num_replicas=world_size, rank=rank, shuffle=True
     ) if world_size > 1 else None
@@ -425,6 +474,7 @@ def train(args):
         sampler=train_sampler, shuffle=(train_sampler is None),
         num_workers=n_workers, pin_memory=(device.type == "cuda"), drop_last=True,
         persistent_workers=(n_workers > 0),
+        prefetch_factor=4 if n_workers > 0 else None,
     )
     # Val: no distributed sampler — rank 0 evaluates on full val set
     val_loader = DataLoader(
@@ -432,9 +482,26 @@ def train(args):
         shuffle=False, num_workers=n_workers,
         pin_memory=(device.type == "cuda"), drop_last=False,
         persistent_workers=(n_workers > 0),
+        prefetch_factor=4 if n_workers > 0 else None,
     )
     if is_main:
         print(f"  {len(train_ds):,} train sequences | {len(train_loader)} batches/epoch")
+
+    # ── Logic mixing (catastrophic forgetting prevention) ──
+    if args.logic_mix > 0:
+        if not args.logic_dir:
+            raise ValueError("--logic_dir is required when --logic_mix > 0")
+        logic_ds = ShardedTokenDataset(args.logic_dir, args.seq_len, split="train")
+        logic_loader = DataLoader(
+            logic_ds, batch_size=args.batch_size,
+            shuffle=True, num_workers=min(4, n_workers), drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(n_workers > 0),
+            prefetch_factor=2 if n_workers > 0 else None,
+        )
+        train_loader = MixedDataLoader(train_loader, logic_loader, args.logic_mix)
+        if is_main:
+            print(f"Logic mix: {args.logic_mix:.0%} of batches from {args.logic_dir}")
 
     # ── Model ──
     cfg = TensionConfig(
@@ -458,25 +525,30 @@ def train(args):
     else:
         model = TensionLM(cfg).to(device)
 
-    # Compile first, then wrap with DDP
+    # Compile BEFORE DDP wrap — torch.compile sees the base model, not the DDP wrapper.
     if device.type == "cuda":
         try:
-            # dynamic=False: shard-based training has fixed input shapes — lets the
-            # compiler generate shape-specific kernels instead of symbolic-shape code.
-            # max-autotune-no-cudagraphs: full kernel autotuning without CUDAGraphs
-            # (no-cudagraphs is safer with DDP's gradient hook mechanism).
-            model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
+            model = torch.compile(
+                model,
+                dynamic=False,
+                mode="max-autotune",  # full autotune including CUDAGraphs
+            )
             if is_main:
-                print("torch.compile: max-autotune-no-cudagraphs, dynamic=False")
+                print("torch.compile: max-autotune (CUDAGraphs enabled)")
         except Exception as e:
             if is_main:
                 print(f"torch.compile: skipped ({e})")
 
     if world_size > 1:
-        model = DDP(model, device_ids=[device.index],
-                    find_unused_parameters=False, broadcast_buffers=False)
+        model = DDP(
+            model,
+            device_ids=[device.index],
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+            static_graph=True,  # safe because architecture doesn't change during training
+        )
         if is_main:
-            print(f"DDP: {world_size} GPUs")
+            print(f"DDP: {world_size} GPUs (static_graph=True)")
     else:
         if is_main and device.type == "cuda":
             n_gpus = torch.cuda.device_count()
@@ -588,7 +660,7 @@ def train(args):
                     loss_ce   = criterion(
                         logits.reshape(-1, cfg.vocab_size), targets.reshape(-1))
                     loss_mcl  = manifold_closure_loss(hidden)
-                    loss_div  = tension_diversity_loss(tensions)
+                    loss_div  = tension_diversity_loss(tensions, _unwrap(model).window_groups)
                     loss_cons = constraint_consistency_loss(tensions)
                     loss_ent  = tension_entropy_loss(tensions)
                     loss      = (loss_ce
