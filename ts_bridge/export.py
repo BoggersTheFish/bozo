@@ -60,6 +60,19 @@ class ExportStats:
     edges_emitted: int
     nodes_touched: int
     mean_weight:   float   # over emitted edges
+    # Concentration of aggregated τ over the (query, key) pairs.  Gini ∈ [0, 1]:
+    # 0 = uniform (every pair gets the same mass), 1 = all mass on one pair.
+    # Coherent text should produce higher concentration than salad, even when
+    # edge counts are similar, because structure shows up as peakiness.
+    concentration: float = 0.0
+    # Mean τ of the aggregated matrix before threshold.  Comparing this pre-
+    # filter lets us see if the model's raw response differs from salad even
+    # when the post-threshold edge count doesn't.
+    aggregated_mean: float = 0.0
+    # True when the classifier returned no signal heads and we fell back to
+    # averaging over all heads.  Variance-check summary breaks cleanly by
+    # this flag — fallback runs are not filter-tested samples.
+    used_head_fallback: bool = False
 
 
 class TauExporter:
@@ -177,10 +190,15 @@ class TauExporter:
         signal_heads = self._current_signal_heads(local_tensions)
 
         # Build a mask over (layer, head) to vectorise the head aggregation.
+        used_fallback = False
         if not signal_heads:
-            # Fall back to all heads rather than producing an empty graph —
-            # likely model not yet trained enough to show specialisation.
+            # Fall back to all heads rather than producing an empty graph.
+            # Common causes: context length < W (peak_pos metric useless),
+            # or model genuinely has no heads that classify LONG_RANGE /
+            # MID_RANGE on this prompt.  Flag it so the caller can tell
+            # filtered runs apart from fallback runs.
             head_mask = np.ones((L, H), dtype=bool)
+            used_fallback = True
         else:
             head_mask = np.zeros((L, H), dtype=bool)
             for (l, h) in signal_heads:
@@ -194,6 +212,25 @@ class TauExporter:
             aggregated = lh_tau[:, :, mask_flat].mean(axis=-1)      # T W
         else:
             aggregated = lh_tau.mean(axis=-1)                        # T W
+
+        # Concentration (Gini) over valid causal pairs in the aggregated matrix.
+        # Only include pairs where s = t - (W - w) >= 0 — positions outside the
+        # context are zero-padded in the kernel and would inflate the Gini
+        # toward 1 for short sequences without carrying any real signal.
+        valid_mask = np.zeros((T, W), dtype=bool)
+        for _t in range(T):
+            for _w in range(W):
+                if _t - (W - _w) >= 0:
+                    valid_mask[_t, _w] = True
+        valid_vals = aggregated[valid_mask]
+        if valid_vals.size > 1 and valid_vals.sum() > 1e-9:
+            sorted_vals = np.sort(valid_vals)
+            n = sorted_vals.size
+            cum = np.cumsum(sorted_vals)
+            gini = float((n + 1 - 2 * cum.sum() / cum[-1]) / n)
+        else:
+            gini = 0.0
+        aggregated_mean = float(valid_vals.mean()) if valid_vals.size else 0.0
 
         # Convert to (query_pos, key_pos) pairs, then emit edges.
         edges_emitted = 0
@@ -259,4 +296,7 @@ class TauExporter:
             edges_emitted   = edges_emitted,
             nodes_touched   = len(nodes_touched),
             mean_weight     = float(np.mean(weights_emitted)) if weights_emitted else 0.0,
+            concentration   = gini,
+            aggregated_mean = aggregated_mean,
+            used_head_fallback = used_fallback,
         )
