@@ -114,7 +114,8 @@ class MultiHeadCausalTensionLayer(nn.Module):
     """
     def __init__(self, cfg: TensionConfig, global_layer: bool = False):
         super().__init__()
-        self.window     = cfg.max_seq_len if global_layer else cfg.window
+        self.window       = cfg.max_seq_len if global_layer else cfg.window
+        self.local_window = cfg.window   # always the local W; used to downsample global tau
         self.global_layer = global_layer
         self.num_heads  = cfg.num_heads
         self.head_dim   = cfg.head_dim
@@ -188,8 +189,6 @@ class MultiHeadCausalTensionLayer(nn.Module):
         q = self.wq(x).view(B, T, self.num_heads, HD)
 
         if self.rope_enabled:
-            # Separate K and V projections — no split/cat/split cycle.
-            # Saves 3 tensor allocations vs the old fused path.
             k = self.wk(x).view(B, T, self.num_heads, HD)
             v = self.wv(x).view(B, T, self.num_heads, HD)
             q = self.rope(q, T)
@@ -198,39 +197,69 @@ class MultiHeadCausalTensionLayer(nn.Module):
             kv = self.wkv(x).view(B, T, self.num_heads, HD * 2)
             k, v = kv.split(HD, dim=-1)
 
-        if self.use_triton and x.is_cuda and not return_tensions:
-            # Fused kernel path — never materialises the B×T×H×W×HD tensor.
-            # return_tensions=True falls through to the unfold path (needed for the
-            # diversity loss and tension visualisation).
+        # ── Global layer: full-sequence pairwise path ─────────────────────────
+        # The unfold path for global layers would materialise B×T×H×T×HD
+        # (e.g. 4×1024×16×1024×64 = 4 GB per layer in bf16) — manageable — but
+        # the original W=max_seq_len=2048 buffer is even larger (8 GB+).
+        # Instead, compute full pairwise scores directly via einsum:
+        # scores[b,t,h,s] = dot(q[b,t,h], k[b,s,h]) / scale  → B T H T
+        # Memory: O(B·T²·H) ≈ 4×1024²×16 × 2 bytes = 134 MB per global layer.
+        # This is identical to standard full attention, just sigmoid instead of softmax.
+        if self.global_layer:
+            # scores: B T H T
+            scores = torch.einsum("bthd,bshd->bths", q, k) / self.scale
+            # Causal mask: position t can only attend to s ≤ t
+            causal = torch.tril(torch.ones(T, T, device=x.device, dtype=scores.dtype))
+            tau    = torch.sigmoid(scores) * causal.unsqueeze(0).unsqueeze(2)  # B T H T
+            tau_mass = tau.sum(-1).clamp(min=1e-6)                             # B T H
+            msg    = torch.einsum("bths,bshd->bthd", tau, v)                  # B T H HD
+            msg    = msg / tau_mass.unsqueeze(-1)                              # B T H HD
+            out    = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
+            if return_tensions:
+                # Downsample tau to the local window size for compatibility with
+                # diversity / consistency losses and visualisation tools that expect
+                # tau shape [B, T, H, W].  Take the W most-recent positions (causal).
+                W_eff = min(self.local_window, T)
+                tau_local = tau[:, :, :, :T].flip(-1)[:, :, :, :W_eff]  # B T H W_eff
+                return out, tau_local
+            return out
+
+        # ── Local layer: Triton fused kernel path ────────────────────────────
+        # Never materialises the B×T×H×W×HD tensor.  When return_tensions=True
+        # the kernel also emits tau [B,T,H,W] directly, keeping the unfold path
+        # off the hot path during aux-loss / sparse-grad / FF training.
+        if self.use_triton and x.is_cuda:
             from triton_tension import causal_tension
-            msg = causal_tension(q, k, v, self.window, self.scale)  # B T H HD (float32)
-            # Magnitude normalisation: divide by number of valid window positions.
-            msg = msg / self.valid_count[:T, None, None]             # B T H HD
+            if return_tensions:
+                msg_raw, tau = causal_tension(
+                    q, k, v, self.window, self.scale, return_tau=True,
+                )
+                # Tau-mass normalisation matches the unfold reference path and is
+                # what TS theory prescribes: output proportional to total constraint
+                # mass, not to the count of positions that could have constrained.
+                tau_mass = tau.sum(-1).clamp(min=1e-6)                 # B T H
+                msg = msg_raw / tau_mass.unsqueeze(-1)
+                out = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
+                return out, tau
+            msg = causal_tension(q, k, v, self.window, self.scale)     # B T H HD
+            msg = msg / self.valid_count[:T, None, None]
             msg = self.dropout(msg)
             out = self.norm(x + self.wo(msg.reshape(B, T, D)))
             return out
 
-        # Unfold path (reference, also used when return_tensions=True)
+        # ── Local layer: unfold reference path ───────────────────────────────
+        # Fallback for CPU / when Triton is disabled.
         nb_k = self._gather_window(k, T)  # B T H W HD
         nb_v = self._gather_window(v, T)  # B T H W HD
 
-        # Independent sigmoid per pair — no softmax, no competition.
-        # Mask zeroes out positions where the window overlaps pre-sequence padding.
         tau = torch.sigmoid(
-            (q.unsqueeze(3) * nb_k).sum(-1) / self.scale   # B T H W
-        ) * self.causal_mask[:T].unsqueeze(1)               # B T H W * (T 1 W)
-        # No dropout on tau — randomly zeroing constraint edges corrupts the graph
-        # structure that the TS-native losses are trying to build.
-        # Dropout is applied to the projected output instead (below).
+            (q.unsqueeze(3) * nb_k).sum(-1) / self.scale
+        ) * self.causal_mask[:T].unsqueeze(1)               # B T H W
 
-        msg = (tau.unsqueeze(-1) * nb_v).sum(3)             # B T H HD
-        # Tau-mass normalisation: divide by total constraint mass (Σ τ) rather than
-        # valid position count.  TS-correct: a node's output should be proportional
-        # to the total constraint acting on it, not the count of positions that could
-        # have constrained it.  Clamp at 1e-6 to avoid div-by-zero on early tokens.
-        tau_mass = tau.sum(-1).clamp(min=1e-6)               # B T H
-        msg = msg / tau_mass.unsqueeze(-1)                   # B T H HD
-        out = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
+        msg      = (tau.unsqueeze(-1) * nb_v).sum(3)        # B T H HD
+        tau_mass = tau.sum(-1).clamp(min=1e-6)
+        msg      = msg / tau_mass.unsqueeze(-1)
+        out      = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
 
         if return_tensions:
             return out, tau
