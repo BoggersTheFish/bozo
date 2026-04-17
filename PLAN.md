@@ -212,7 +212,10 @@ TensionLM's internal representation is already a weighted graph, which makes it 
 | 1.5 | ✓ | `StreamingTauExporter` — per-step τ export during generation, parity with batch ingest (527 edges, max-weight Δ = 1.2e-7) |
 | 2.0 | ✓ | `GraphBias` + `tau_bias: [B,T,W]` plumbed through `MultiHeadCausalTensionLayer`, `TensionBlock`, `TensionLM`. No-op invariant exact; responsiveness KL ≈ 1.7e-2; directional KL ≈ 2.6e-1 |
 | 2.1 | ✓ | Closed-loop `biased_generate` — graph biases forward, forward updates graph. Diverges at token 1/20 under matched seeds on diagnostic checkpoint |
-| 2.2 | — | α calibration on 117M-curriculum, global-layer bias, Triton-fused bias, `--export_mode unbiased` to break the positive feedback loop |
+| 2.2a | ✓ 034a61d | `--export_mode {biased,unbiased,off}` on `closed_loop_generate` to decouple graph growth from bias feedback |
+| 2.2b | ✓ e4a10d8 | Global-layer graph bias — `tau_bias_global: [B,T,T]` plumbed through `TensionLM.forward` |
+| 2.2c | ✓ 03f050b | Triton-fused graph bias — kernel `Bias` pointer + `HAS_BIAS` constexpr, σ' recomputed from biased τ, no dBias grad |
+| 2.2d | ✓ | α calibration on 117M-curriculum. Sweep: α∈{0.25,0.5,1,2,4,8,16} × {seed=42, seed=7} × 60 new tokens. Silent ≤ α=2; inflection at α≈4 (seed-dependent); α=8 reliably opens the loop (+9–19 edges, +0.026–0.073 mean-w vs unbiased-export), text coherent; α=16 degrades |
 | 3 | — | Integration A/B vs `BoggersTheAI` stock surface on held-out QA (contradiction rate, trace confidence) |
 
 This track is cleanly separable from the main training roadmap. Landing it widens what the surface-level research can inform later; not landing it doesn't invalidate the LLM work.

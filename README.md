@@ -173,6 +173,7 @@ TensionLM's τ field is structurally identical to a weighted graph, so the model
 - **Phase 1.5 — Generation-time streaming** (landed): `StreamingTauExporter` — per-step edge writes during autoregressive generation. Bit-parity with batch ingest.
 - **Phase 2.0 — Graph → surface biasing** (landed): optional `tau_bias` added to the τ precursor pre-sigmoid, head-agnostic, threaded through every local-attention layer. A/B smoke confirms no-op / responsive / directional mechanism.
 - **Phase 2.1 — Closed loop** (landed): `biased_generate.py` — graph biases forward, forward writes τ-edges back each step.
+- **Phase 2.2 — Hardening + α calibration** (landed): `--export_mode {biased,unbiased,off}` decouples graph growth from bias strength; global-layer `tau_bias_global: [B,T,T]` plumbed; Triton kernel accepts `Bias` with σ' recomputed from biased τ. α sweep on 117M-curriculum (`ts_bridge.alpha_sweep`): silent ≤ α=2, inflection α≈4, loop reliably opens at α=8 (+9–19 edges, +0.026–0.073 mean-w vs unbiased-export), text degrades past α=16.
 
 All of the above is bidirectional plumbing between TensionLM and a `UniversalLivingGraph`-shaped substrate. Used or ignored as downstream needs dictate; the LLM stands on its own.
 
