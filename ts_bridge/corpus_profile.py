@@ -164,6 +164,7 @@ def main():
     print(f"profiling on {len(passages)} wikitext passages …")
 
     all_stats: list[dict] = []
+    aggregated_samples: list[np.ndarray] = []   # for per-corpus quantile picking
     for i, text in enumerate(passages):
         ids = tokenizer.encode(text).ids[:cfg.max_seq_len]
         if len(ids) < cfg.window + 4:     # too short to exercise the full window
@@ -176,6 +177,10 @@ def main():
         local  = [t for t in all_tau if tuple(t.shape[-2:]) == canon]
         tau    = torch.stack([t[0].float() for t in local])       # L T H W
         all_stats.append(_per_head_stats(tau))
+        # Stash the full τ so we can compute aggregated-τ quantiles after
+        # the corpus-level head selection is known.  Move to CPU/numpy to
+        # cap memory on GPU runs.
+        aggregated_samples.append(tau.cpu().numpy())
         if (i + 1) % 10 == 0:
             print(f"  profiled {i+1}/{len(passages)}")
 
@@ -211,6 +216,32 @@ def main():
     print("Layer distribution: "
           + ", ".join(f"L{l}:{c}" for l, c in sorted(layer_dist.items())))
 
+    # Aggregated-τ quantiles across the corpus, using the corpus-selected
+    # heads.  Lets downstream code pick edge_threshold by target density
+    # instead of guessing: threshold at quantile q emits (1-q) of all valid
+    # causal pairs, so q=0.80 → ~20% density on a windowed local graph.
+    threshold_table: dict[str, float] = {}
+    if signal:
+        head_mask = np.zeros((L, H), dtype=bool)
+        for (l, h) in signal:
+            head_mask[l, h] = True
+        mask_flat = head_mask.reshape(-1)
+        all_valid_vals: list[np.ndarray] = []
+        for tau_np in aggregated_samples:
+            Lp, T, Hp, W = tau_np.shape
+            lh = tau_np.transpose(1, 3, 0, 2).reshape(T, W, Lp * Hp)
+            agg_mat = lh[:, :, mask_flat].mean(axis=-1)           # T W
+            t_idx = np.arange(T)[:, None]; w_idx = np.arange(W)[None, :]
+            valid = (t_idx + w_idx >= W)
+            all_valid_vals.append(agg_mat[valid])
+        all_vals = np.concatenate(all_valid_vals)
+        for q, name in [(0.50, "q50"), (0.70, "q70"), (0.80, "q80"),
+                        (0.90, "q90"), (0.95, "q95")]:
+            threshold_table[name] = float(np.quantile(all_vals, q))
+        print("\nAggregated-τ quantiles over corpus (via selected heads):")
+        for k, v in threshold_table.items():
+            print(f"  {k}:  {v:.3f}   → threshold gives ~{(1 - float(k[1:])/100)*100:.0f}% density")
+
     out = {
         "checkpoint":     str(Path(args.checkpoint).resolve()),
         "n_samples":      len(all_stats),
@@ -219,6 +250,14 @@ def main():
         "window":         cfg.window,
         "signal_heads":   signal,
         "thresholds":     {"min_max_tau": 0.40, "min_concentration": 0.35},
+        "edge_threshold_quantiles": threshold_table,
+        # Recommendation: use q50 as the edge threshold.  Empirically it
+        # both (a) matches the historical default 0.30 on this checkpoint and
+        # (b) gives the tightest coherent/salad discrimination in variance
+        # check.  Raising the threshold to q80 ("~20% density") produces a
+        # sparser graph but degrades discrimination — use it only for
+        # downstream integration where sparsity matters more than the delta.
+        "recommended_edge_threshold": threshold_table.get("q50", 0.30),
         "per_head_stats": {
             "max_tau":       agg["max_tau"].tolist(),
             "concentration": agg["concentration"].tolist(),

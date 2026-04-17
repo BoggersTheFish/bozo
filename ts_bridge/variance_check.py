@@ -158,12 +158,22 @@ def main():
     args = ap.parse_args()
 
     head_override: list[tuple[int, int]] | None = None
+    edge_threshold = args.edge_threshold
     if args.head_profile:
         import json
         prof = json.loads(Path(args.head_profile).read_text())
         head_override = [tuple(lh) for lh in prof["signal_heads"]]
         print(f"using corpus-profiled head set: {len(head_override)} heads "
               f"(from {args.head_profile})")
+        # q50 from the profile matches the historical default on 117M-Curriculum
+        # and empirically gives the tightest coherent/salad discrimination.
+        # Only auto-adopt when the caller is still on the hard-coded default.
+        if abs(args.edge_threshold - 0.3) < 1e-9:
+            q50 = prof.get("edge_threshold_quantiles", {}).get("q50")
+            if q50 is not None:
+                edge_threshold = float(q50)
+                print(f"  using edge_threshold = {edge_threshold:.3f} "
+                      "(q50 from corpus profile — tightest discrimination)")
 
     model, tokenizer, cfg = load_model(args.checkpoint, args.device, args.tokenizer)
     print(f"model: dim={cfg.dim} layers={cfg.num_layers} heads={cfg.num_heads} "
@@ -190,10 +200,10 @@ def main():
 
         g_log, s_log, _ = export_for(log_ids, model, tokenizer, args.device,
                                      head_override=head_override,
-                                     edge_threshold=args.edge_threshold)
+                                     edge_threshold=edge_threshold)
         g_sal, s_sal, _ = export_for(sal_ids, model, tokenizer, args.device,
                                      head_override=head_override,
-                                     edge_threshold=args.edge_threshold)
+                                     edge_threshold=edge_threshold)
 
         # Ratio fallbacks: when salad produces zero signal, use the logical
         # count as an "infinity proxy" capped at the number of candidate pairs.
