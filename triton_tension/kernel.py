@@ -1,8 +1,13 @@
 """
 Fused causal sigmoid tension kernels.
 
-Forward: out[b,t,h] = Σ_w  sigmoid(dot(Q[t], K[t-(W-w)]) / scale) · V[t-(W-w)]
-         for w in [0, W-1], skipping positions where t-(W-w) < 0
+Forward: out[b,t,h] = Σ_w  sigmoid(dot(Q[t], K[t-(W-w)]) / scale + bias[b,t,w])
+                           · V[t-(W-w)]
+         for w in [0, W-1], skipping positions where t-(W-w) < 0.
+
+`bias` is the Phase-2 graph-bias tensor (shape [B, T, W], head-agnostic).
+When HAS_BIAS is false the kernel takes the unbiased path — identical to the
+pre-Phase-2 behaviour.
 
 Optionally also emits tau[b,t,h,w] when HAS_TAU is true — lets callers use the
 fused path with return_tensions=True instead of falling through to the unfold
@@ -16,6 +21,13 @@ Both accept an optional dTau input — when HAS_DTAU is true, the gradient
 flowing in through tau (from aux losses, sparse-grad gate, FF goodness) is
 added to the d(dot) term before chain-ruling into Q and K.
 
+Bias treatment in backward: bias is an additive pre-sigmoid constant with no
+gradient of its own (graph edges are not learned params), so dBias is not
+produced.  But σ'(x) = σ(x)·(1−σ(x)) is evaluated at the *biased* argument,
+so HAS_BIAS must be fed into both backward kernels whenever it was fed into
+forward — otherwise the recomputed τ in backward disagrees with the forward τ
+and the dQ/dK gradients drift.
+
 Memory: O(B·T·H·HD) output + O(B·T·H·W) tau when requested.
 Never materialises the O(B·T·H·W·HD) expanded window tensor.
 """
@@ -28,16 +40,18 @@ import triton.language as tl
 
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, Out, Tau,
+    Q, K, V, Out, Tau, Bias,
     T, H, W, scale,
     sq_b, sq_t, sq_h, sq_d,
     sk_b, sk_t, sk_h, sk_d,
     sv_b, sv_t, sv_h, sv_d,
     so_b, so_t, so_h, so_d,
     st_b, st_t, st_h, st_w,
+    sbias_b, sbias_t, sbias_w,
     HD: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_TAU: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """One program per (batch, head, T-tile)."""
     pid    = tl.program_id(0)
@@ -61,7 +75,8 @@ def _fwd_kernel(
 
     acc = tl.zeros([BLOCK_T, HD], dtype=tl.float32)
 
-    tau_base = b * st_b + h * st_h
+    tau_base  = b * st_b + h * st_h
+    bias_base = b * sbias_b  # bias is head-agnostic [B, T, W]
 
     for w in range(W):
         # Source position: t - (W - w).  w=0 → oldest; w=W-1 → most recent past.
@@ -83,7 +98,15 @@ def _fwd_kernel(
         ).to(tl.float32)
 
         dots = (tl.sum(q * k, axis=1) / scale).to(tl.float32)
-        tau  = tl.sigmoid(dots) * src_ok.to(tl.float32)
+
+        if HAS_BIAS:
+            bias_val = tl.load(
+                Bias + bias_base + t_off * sbias_t + w * sbias_w,
+                mask=t_ok, other=0.0,
+            ).to(tl.float32)
+            dots += bias_val
+
+        tau = tl.sigmoid(dots) * src_ok.to(tl.float32)
 
         acc += tau[:, None] * v
 
@@ -106,16 +129,18 @@ def _fwd_kernel(
 
 @triton.jit
 def _bwd_dq_kernel(
-    Q, K, V, dOut, dTau, dQ,
+    Q, K, V, dOut, dTau, Bias, dQ,
     T, H, W, scale,
     sq_b, sq_t, sq_h, sq_d,
     sk_b, sk_t, sk_h, sk_d,
     sv_b, sv_t, sv_h, sv_d,
     sd_b, sd_t, sd_h, sd_d,
     sdt_b, sdt_t, sdt_h, sdt_w,
+    sbias_b, sbias_t, sbias_w,
     HD: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_DTAU: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """
     dQ: same window scan as forward.
@@ -141,6 +166,7 @@ def _bwd_dq_kernel(
     q_base    = b * sq_b + h * sq_h
     dout_base = b * sd_b + h * sd_h
     dtau_base = b * sdt_b + h * sdt_h
+    bias_base = b * sbias_b
 
     q = tl.load(
         Q + q_base + t_off[:, None] * sq_t + d_off[None, :] * sq_d,
@@ -172,7 +198,15 @@ def _bwd_dq_kernel(
             mask=src_ok[:, None], other=0.0,
         ).to(tl.float32)
 
-        dots  = (tl.sum(q * k, axis=1) / scale).to(tl.float32)
+        dots = (tl.sum(q * k, axis=1) / scale).to(tl.float32)
+
+        if HAS_BIAS:
+            bias_val = tl.load(
+                Bias + bias_base + t_off * sbias_t + w * sbias_w,
+                mask=t_ok, other=0.0,
+            ).to(tl.float32)
+            dots += bias_val
+
         tau   = tl.sigmoid(dots) * src_ok.to(tl.float32)
         dtau  = tl.sum(dout * v, axis=1)
 
@@ -197,16 +231,18 @@ def _bwd_dq_kernel(
 
 @triton.jit
 def _bwd_dkv_kernel(
-    Q, K, V, dOut, dTau, dK, dV,
+    Q, K, V, dOut, dTau, Bias, dK, dV,
     T, H, W, scale,
     sq_b, sq_t, sq_h, sq_d,
     sk_b, sk_t, sk_h, sk_d,
     sv_b, sv_t, sv_h, sv_d,
     sd_b, sd_t, sd_h, sd_d,
     sdt_b, sdt_t, sdt_h, sdt_w,
+    sbias_b, sbias_t, sbias_w,
     HD: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_DTAU: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     """
     For K/V position ts, accumulate gradients from all future query positions
@@ -249,6 +285,7 @@ def _bwd_dkv_kernel(
     q_base    = b * sq_b + h * sq_h
     dout_base = b * sd_b + h * sd_h
     dtau_base = b * sdt_b + h * sdt_h
+    bias_base = b * sbias_b
 
     for delta in range(1, W + 1):
         tq      = ts_off + delta
@@ -266,6 +303,15 @@ def _bwd_dkv_kernel(
         ).to(tl.float32)
 
         dots = (tl.sum(q * k, axis=1) / scale).to(tl.float32)
+
+        if HAS_BIAS:
+            # Forward loop index for this (tq, ts) pair is w = W - delta.
+            w_fwd_bias = W - delta
+            dots += tl.load(
+                Bias + bias_base + tq_safe * sbias_t + w_fwd_bias * sbias_w,
+                mask=q_ok, other=0.0,
+            ).to(tl.float32)
+
         tau  = tl.sigmoid(dots) * q_ok.to(tl.float32)
 
         dv += tau[:, None] * dout

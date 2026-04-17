@@ -242,18 +242,14 @@ class MultiHeadCausalTensionLayer(nn.Module):
         # the kernel also emits tau [B,T,H,W] directly, keeping the unfold path
         # off the hot path during aux-loss / sparse-grad / FF training.
         #
-        # Phase 2 bias is not plumbed into the fused kernel; callers that need
-        # biasing must run on CPU or disable Triton so the unfold path runs.
-        if tau_bias is not None and self.use_triton and x.is_cuda:
-            raise NotImplementedError(
-                "tau_bias is not supported by the fused Triton kernel. "
-                "Set cfg.use_triton=False (or run on CPU) to use the unfold path."
-            )
+        # Phase 2 bias (optional) is added to the pre-sigmoid dots inside the
+        # kernel — identical semantics to the unfold path, no gather buffer.
         if self.use_triton and x.is_cuda:
             from triton_tension import causal_tension
             if return_tensions:
                 msg_raw, tau = causal_tension(
-                    q, k, v, self.window, self.scale, return_tau=True,
+                    q, k, v, self.window, self.scale,
+                    return_tau=True, bias=tau_bias,
                 )
                 # Tau-mass normalisation matches the unfold reference path and is
                 # what TS theory prescribes: output proportional to total constraint
@@ -262,7 +258,9 @@ class MultiHeadCausalTensionLayer(nn.Module):
                 msg = msg_raw / tau_mass.unsqueeze(-1)
                 out = self.norm(x + self.dropout(self.wo(msg.reshape(B, T, D))))
                 return out, tau
-            msg = causal_tension(q, k, v, self.window, self.scale)     # B T H HD
+            msg = causal_tension(
+                q, k, v, self.window, self.scale, bias=tau_bias,
+            )                                                          # B T H HD
             msg = msg / self.valid_count[:T, None, None]
             msg = self.dropout(msg)
             out = self.norm(x + self.wo(msg.reshape(B, T, D)))

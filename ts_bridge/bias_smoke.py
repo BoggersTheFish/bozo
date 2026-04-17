@@ -87,8 +87,16 @@ def run_forward(
     bias:        torch.Tensor | None = None,
     bias_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return last-position logits [vocab]."""
-    out = model(ctx_tensor, tau_bias=bias, tau_bias_global=bias_global)
+    """
+    Return last-position logits [vocab].  Forced through return_all=True so
+    both the Triton and unfold local-layer paths normalise by tau_mass
+    (their return_all=False branches disagree on normalisation — the Triton
+    path falls back to valid_count there).
+    """
+    out, _, _ = model(
+        ctx_tensor, return_all=True,
+        tau_bias=bias, tau_bias_global=bias_global,
+    )
     return out[0, -1].float()
 
 
@@ -102,11 +110,22 @@ def main():
     ap.add_argument("--edge_weight", type=float, default=1.0,
                     help="Seeded edge weight (after α, bias magnitude ≈ α·this)")
     ap.add_argument("--top_k",      type=int, default=5)
+    ap.add_argument("--force_triton", action="store_true",
+                    help="Override load_model's use_triton=False so the fused "
+                         "kernel is exercised on CUDA. No-op on CPU.")
     args = ap.parse_args()
 
     model, tokenizer, cfg = load_model(
         args.checkpoint, args.device, args.tokenizer,
     )
+    if args.force_triton and args.device != "cpu":
+        # load_model defensively forces use_triton=False for CPU smoke;
+        # flip it back on at the layer level for this CUDA run.
+        for block in model.blocks:
+            if not block.tension.global_layer:
+                block.tension.use_triton = True
+        cfg.use_triton = True
+        print("force_triton: fused kernel enabled on local layers")
     ids = token_ids_for(PROMPT, tokenizer, cfg.max_seq_len)
     T   = len(ids)
     W   = cfg.window

@@ -29,12 +29,15 @@ def _strides4(t: Tensor):
 def _ref_forward(
     Q: Tensor, K: Tensor, V: Tensor, W: int, scale: float,
     return_tau: bool = False,
+    bias: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """
     Reference implementation — identical semantics to the Triton kernel
-    (raw Σ τ·V output, no normalisation; optional tau [B,T,H,W]).
-    Used for float64 inputs (gradcheck) and CPU.  Autograd differentiates
-    through this naturally, so no manual backward needed.
+    (raw Σ τ·V output, no normalisation; optional tau [B,T,H,W]).  Used for
+    float64 inputs (gradcheck) and CPU.  Autograd differentiates through
+    this naturally, so no manual backward needed.
+
+    bias : optional [B, T, W], added to the pre-sigmoid dots (head-agnostic).
     """
     B, T, H, HD = Q.shape
     kv = torch.cat([K, V], dim=-1)
@@ -48,9 +51,11 @@ def _ref_forward(
     w_idx = torch.arange(W, device=Q.device).unsqueeze(0)
     mask  = (t_idx + w_idx >= W).to(Q.dtype)             # T W
 
-    tau = torch.sigmoid(
-        (Q.unsqueeze(3) * nb_k).sum(-1) / scale
-    ) * mask.unsqueeze(0).unsqueeze(2)                   # B T H W
+    dots = (Q.unsqueeze(3) * nb_k).sum(-1) / scale       # B T H W
+    if bias is not None:
+        dots = dots + bias.unsqueeze(2).to(dots.dtype)   # broadcast over H
+
+    tau = torch.sigmoid(dots) * mask.unsqueeze(0).unsqueeze(2)   # B T H W
 
     msg = (tau.unsqueeze(-1) * nb_v).sum(3)              # B T H HD
     if return_tau:
@@ -60,11 +65,16 @@ def _ref_forward(
 
 # ── Triton autograd.Function ──────────────────────────────────────────────────
 
+def _strides3(t: Tensor):
+    assert t.ndim == 3
+    return t.stride(0), t.stride(1), t.stride(2)
+
+
 class _CausalTensionFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, Q: Tensor, K: Tensor, V: Tensor, W: int, scale: float,
-                return_tau: bool):
+                return_tau: bool, bias: Tensor | None):
         B, T, H, HD = Q.shape
 
         Out = torch.zeros(B, T, H, HD, dtype=torch.float32, device=Q.device)
@@ -77,19 +87,37 @@ class _CausalTensionFn(torch.autograd.Function):
             Tau = Q
             tau_strides = (0, 0, 0, 0)
 
+        has_bias = bias is not None
+        if has_bias:
+            # Kernel expects float32; normalise up front so backward can reuse.
+            Bias = bias.contiguous().to(torch.float32)
+            assert Bias.ndim == 3 and Bias.shape == (B, T, W), (
+                f"bias must be [B, T, W]=[{B}, {T}, {W}], got {tuple(Bias.shape)}"
+            )
+            bias_strides = _strides3(Bias)
+        else:
+            Bias = Q  # placeholder, never read when HAS_BIAS=False
+            bias_strides = (0, 0, 0)
+
         grid = (B * H * math.ceil(T / BLOCK_T),)
 
         _fwd_kernel[grid](
-            Q, K, V, Out, Tau,
+            Q, K, V, Out, Tau, Bias,
             T, H, W, scale,
             *_strides4(Q), *_strides4(K), *_strides4(V), *_strides4(Out),
             *tau_strides,
-            HD=HD, BLOCK_T=BLOCK_T, HAS_TAU=return_tau,
+            *bias_strides,
+            HD=HD, BLOCK_T=BLOCK_T,
+            HAS_TAU=return_tau, HAS_BIAS=has_bias,
         )
 
-        ctx.save_for_backward(Q, K, V)
+        # Bias is saved so backward can recompute the biased τ.  When absent
+        # we still have to store *something* for save_for_backward's tensor-or-
+        # None invariant — None is fine.
+        ctx.save_for_backward(Q, K, V, Bias if has_bias else None)
         ctx.W, ctx.scale = W, scale
         ctx.return_tau = return_tau
+        ctx.has_bias = has_bias
 
         if return_tau:
             return Out.to(Q.dtype), Tau.to(Q.dtype)
@@ -97,8 +125,9 @@ class _CausalTensionFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        Q, K, V   = ctx.saved_tensors
+        Q, K, V, Bias = ctx.saved_tensors
         W, scale  = ctx.W, ctx.scale
+        has_bias  = ctx.has_bias
         B, T, H, HD = Q.shape
 
         if ctx.return_tau:
@@ -120,6 +149,13 @@ class _CausalTensionFn(torch.autograd.Function):
         else:
             dtau_strides = (0, 0, 0, 0)
 
+        if has_bias:
+            Biasf = Bias  # already float32 from forward
+            bias_strides = _strides3(Biasf)
+        else:
+            Biasf = Qf
+            bias_strides = (0, 0, 0)
+
         dQ = torch.zeros_like(Qf)
         dK = torch.zeros_like(Kf)
         dV = torch.zeros_like(Vf)
@@ -127,22 +163,28 @@ class _CausalTensionFn(torch.autograd.Function):
         grid = (B * H * math.ceil(T / BLOCK_T),)
 
         _bwd_dq_kernel[grid](
-            Qf, Kf, Vf, dOut, dTau, dQ,
+            Qf, Kf, Vf, dOut, dTau, Biasf, dQ,
             T, H, W, scale,
             *_strides4(Qf), *_strides4(Kf), *_strides4(Vf), *_strides4(dOut),
             *dtau_strides,
-            HD=HD, BLOCK_T=BLOCK_T, HAS_DTAU=has_dtau,
+            *bias_strides,
+            HD=HD, BLOCK_T=BLOCK_T,
+            HAS_DTAU=has_dtau, HAS_BIAS=has_bias,
         )
         _bwd_dkv_kernel[grid](
-            Qf, Kf, Vf, dOut, dTau, dK, dV,
+            Qf, Kf, Vf, dOut, dTau, Biasf, dK, dV,
             T, H, W, scale,
             *_strides4(Qf), *_strides4(Kf), *_strides4(Vf), *_strides4(dOut),
             *dtau_strides,
-            HD=HD, BLOCK_T=BLOCK_T, HAS_DTAU=has_dtau,
+            *bias_strides,
+            HD=HD, BLOCK_T=BLOCK_T,
+            HAS_DTAU=has_dtau, HAS_BIAS=has_bias,
         )
 
-        # Must return one grad per forward input: Q, K, V, W, scale, return_tau
-        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None, None, None
+        # Must return one grad per forward input: Q, K, V, W, scale, return_tau, bias.
+        # Bias has no gradient (graph edges aren't learned) → None.
+        return (dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype),
+                None, None, None, None)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -151,6 +193,7 @@ class _CausalTensionFn(torch.autograd.Function):
 def causal_tension(
     Q: Tensor, K: Tensor, V: Tensor, window: int, scale: float,
     return_tau: bool = False,
+    bias: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """
     Fused causal sigmoid tension.
@@ -164,15 +207,18 @@ def causal_tension(
         window     : causal look-back W
         scale      : dot-product scale (typically sqrt(HD))
         return_tau : also emit tau [B, T, H, W] for aux losses / diagnostics.
+        bias       : optional Phase-2 graph bias [B, T, W], added to the
+                     pre-sigmoid dots.  Head-agnostic (broadcast over H).
 
     Returns:
         out          : [B, T, H, HD] — raw Σ τ·V  (caller normalises)
         (optional) tau : [B, T, H, W] when return_tau=True
     """
     if not Q.is_cuda or Q.dtype == torch.float64:
-        return _ref_forward(Q, K, V, window, scale, return_tau=return_tau)
+        return _ref_forward(Q, K, V, window, scale, return_tau=return_tau,
+                            bias=bias)
 
     Q = Q.contiguous()
     K = K.contiguous()
     V = V.contiguous()
-    return _CausalTensionFn.apply(Q, K, V, window, scale, return_tau)
+    return _CausalTensionFn.apply(Q, K, V, window, scale, return_tau, bias)
