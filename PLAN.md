@@ -105,12 +105,27 @@ Acceptance (`bias_smoke` on `checkpoints/diagnostic/latest.pt`, dim=512, 12L, 8H
 - **Responsiveness** — single seeded edge ⇒ KL(biased ‖ unbiased) ≈ 1.7 × 10⁻² at the last position.
 - **Directional** — two different seeded edges ⇒ KL(A ‖ B) ≈ 2.6 × 10⁻¹.  The bias pathway transmits *which* edge, not just "something is biased."
 
-### Phase 2.1 and beyond (not yet landed)
+### Phase 2.1 — Closed-loop generation (landed 2026-04-17)
 
-- Hook `StreamingTauExporter` + `GraphBias` into `generate.py` so the graph updates every step and feeds back into attention on the next step (closed loop).
-- α calibration against 117M-curriculum's weaker raw-τ coherence signal (~1.056× vs 13.5M's 1.25×) — Phase 1.2 replication flagged this.
+`ts_bridge/biased_generate.py` wires `StreamingTauExporter` and `GraphBias` into a single step-wise loop: build bias from the current graph → forward with `tau_bias` → `ingest_step` writes edges ending at the new last position back into the same graph → sample → repeat.  The surface and substrate are in bidirectional feedback during generation.
+
+Sampling mirrors `model.generate` (nucleus + rep penalty) so biased vs unbiased runs are directly comparable.  An `--ab` flag runs both sides on the same seed.
+
+Acceptance (`biased_generate --ab` on `checkpoints/diagnostic/latest.pt`, α=1.0, seed=42, 20 generated tokens, prompt *"If all mammals are warm-blooded and all whales are mammals then"*):
+
+    biased    : "... then the set is non-emptyemptyemptyemptyempty..."
+    unbiased  : "... then the node is non-emptyemptyemptyemptyempty..."
+    diverge at generated-token index 1 / 20
+    biased graph: 39 nodes / 702 edges, mean w=0.560
+
+The diagnostic checkpoint is weak (synthetic-logic small-scale surface), so the text quality is low on both sides — but the divergence at the first generated token under identical sampling seed confirms the loop closes: graph state influences which token gets emitted, and the next step's graph state includes the edges the previous step just wrote.
+
+### Phase 2.2 and beyond (not yet landed)
+
+- α calibration sweep on 117M-curriculum — raw-τ coherence is ~1.056× vs 13.5M's 1.25× (Phase 1.2 replication), so the bias has less headroom and α needs tuning on the real surface.
 - Global-layer bias path (`[B, T, T]` shape, full-sequence semantics).
-- Fused-kernel bias path (Triton precursor-add before sigmoid).
+- Fused-kernel bias path (Triton precursor-add before sigmoid; currently unbiased callers must run the unfold fallback).
+- Export-of-post-bias-τ is a positive feedback loop by design — add a `--export_mode unbiased` that runs a second tau-bias-free forward for the export path only, when a cleaner graph snapshot is wanted.
 
 ## Phase 3 — Integration A/B (the real paper experiment)
 
