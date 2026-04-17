@@ -97,16 +97,31 @@ def random_salad(vocab_size: int, length: int, seed: int = 0) -> list[int]:
 
 
 @torch.no_grad()
-def export_for(ids: list[int], model, tokenizer, device: str) -> tuple[
-    UniversalLivingGraph, "ExportStats", list
-]:
-    """Run forward, profile+lock heads, ingest, return (graph, stats, head_stats)."""
+def export_for(
+    ids: list[int],
+    model,
+    tokenizer,
+    device: str,
+    head_override: list[tuple[int, int]] | None = None,
+    edge_threshold: float = 0.3,
+) -> tuple[UniversalLivingGraph, "ExportStats", list]:
+    """Run forward, profile+lock heads (or use override), ingest, return
+    (graph, stats, head_stats).  `head_override` lets callers pin the
+    signal-head set to a corpus-profiled one instead of per-prompt."""
     x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     _, _, all_tensions = model(x, return_all=True)
 
     graph = UniversalLivingGraph()
-    exporter = TauExporter(graph, edge_threshold=0.3, include_mid_range=True)
-    head_stats = exporter.profile_and_lock(all_tensions)
+    exporter = TauExporter(
+        graph,
+        edge_threshold    = edge_threshold,
+        include_mid_range = True,
+        head_override     = head_override,
+    )
+    if head_override is None:
+        head_stats = exporter.profile_and_lock(all_tensions)
+    else:
+        head_stats = []
     stats = exporter.ingest(ids, all_tensions, tokenizer)
     return graph, stats, head_stats
 
