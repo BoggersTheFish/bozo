@@ -79,6 +79,8 @@ The full A→B→C transitivity chain encoded as simultaneous active constraints
 
 **Coherence response:** coherent text produces **+25% mean τ** and **+60% more active edges** than random word salad on the same vocabulary. The τ field measurably responds to coherence — which is exactly what you need from a surface that will be exporting edges to a graph.
 
+> **117M replication note (Phase 1.2, 2026-04-17).** The coherence direction replicates on the 117M-Curriculum checkpoint — 10/10 coherent prompts beat their length-matched salads on raw-τ mean — but at **~half the magnitude** (mean-τ ratio ≈ 1.056× vs the 1.25× published here on 13.5M). The finding is robust in sign; the numbers above are regime-specific to the smaller TS-native model. See `ts_bridge/exp2_replicate.py` to reproduce.
+
 ### Experiment 3 — Curriculum matches the TS layering doctrine (13.5M)
 
 Logic → language → maths. Substrate before surface. First-contact maths PPL on the first checkpoint after switching data:
@@ -229,7 +231,12 @@ Note: standalone eval is retained as a surface-viability signal, but it is **not
 See [PLAN.md](./PLAN.md) for the full phase plan. Short version:
 
 - **Phase 0** — Kernel unblock for τ export ✅ (complete 2026-04-16)
-- **Phase 1** — Surface → substrate export (`ts_bridge/`) — current
+- **Phase 1** — Surface → substrate export (`ts_bridge/`) — in flight
+  - 1.0 — first-cut exporter + head filter + graph round-trip ✅
+  - 1.1 — head-classifier recalibration + variance harness ✅
+  - 1.2 — corpus-level head profile (JSON sidecar) + Exp 2 replication on 117M ✅ *(coherence finding replicates qualitatively — 10/10 prompts — at ~half the 13.5M magnitude; see `ts_bridge/exp2_replicate.py`)*
+  - 1.3 — corpus-derived edge-threshold quantiles ✅
+  - 1.5 — generation-time streaming exporter (`ts_bridge/streaming.py`) — current
 - **Phase 2** — Substrate → surface biasing (graph conditions generation)
 - **Phase 3** — Integration A/B benchmark (TensionLM + TS-Core vs Llama + TS-Core)
 - **Phase 4** — Multi-agent coherence (Wave 16 — two TS-native surfaces communicating via shared graph)

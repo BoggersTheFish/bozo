@@ -39,7 +39,7 @@ Fused Triton kernel now optionally emits `tau[B,T,H,W]` directly, so `return_ten
 | 350M + FF (double fwd) peak | OOM | 20.0 GB |
 | Tau path memory (per layer, 350M dims) | 2.1 GB unfold gather | 126 MB fused |
 
-## Phase 1 — Surface → Substrate export (current)
+## Phase 1 — Surface → Substrate export (in flight)
 
 **Goal:** build a clean interface that turns TensionLM's internal tension field into weighted edges on a `UniversalLivingGraph`-shaped target, token by token during generation.
 
@@ -47,24 +47,44 @@ Fused Triton kernel now optionally emits `tau[B,T,H,W]` directly, so `return_ten
 
 **Deliverable:** `ts_bridge/` package in this repo:
 - `ts_bridge/graph.py` — minimal graph shape compatible with `TS-Core/UniversalLivingGraph` (node: content, topics, activation, stability; edge: src, dst, weight, relation). Dict-backed for now.
-- `ts_bridge/export.py` — `TauExporter` that hooks into TensionLM generation and emits edges per token.
+- `ts_bridge/export.py` — `TauExporter` that hooks TensionLM and emits edges from a batched forward pass.
 - `ts_bridge/head_filter.py` — head-specialisation filter; only layers/heads classified long-range-semantic produce graph edges (syntactic-tracking heads are noise at the graph level).
+- `ts_bridge/corpus_profile.py` — corpus-level head profile, written once per checkpoint (see 1.2 below).
+- `ts_bridge/exp2_replicate.py` — 117M raw-τ replication of the Exp 2 coherence finding.
+- `ts_bridge/variance_check.py` — multi-prompt stability test for the exporter.
+- `ts_bridge/streaming.py` — per-step exporter for autoregressive generation (Phase 1.5, current).
 - `ts_bridge/schema.md` — the interface contract. Once stable, this is what goes into TS-Core.
 
 **Edge extraction:**
-- For each generated token `t`, collect τ[layer, head, t, w] across all layers.
-- Filter to heads tagged `long_range_semantic` by the head-specialisation classifier (from `visualise.py`).
+- For each generated token `t`, collect τ[layer, head, t, w] across all local-attention layers.
+- Filter to heads tagged `LONG_RANGE` (and optionally `MID_RANGE`) by the head classifier. Lock the head set from a **corpus-level** profile, not per-prompt (per-prompt locking is content-unstable — Jaccard 0.33–0.69 across prompts).
 - Aggregate: `edge_weight(t, t-w-1) = mean over selected heads of τ[·, ·, t, w]`.
-- Threshold: emit edge only when aggregated weight > 0.3 (keeps the graph sparse).
+- Threshold: `edge_threshold` defaults to the 0.75 quantile of aggregated τ under a corpus-derived calibration (see 1.3 below); 0.3 is the hand-picked legacy default.
 - Node content = decoded token (pending a concept-extraction pass later).
-- `stability` seeded at 0.5; `activation` seeded at the emitted-token log-probability.
+- Activation seeded from the aggregated pull; stability left at the `UniversalLivingGraph` default (0.5).
 
-**Validation:**
-- Smoke test: generate a logical sentence ("If all mammals are warm-blooded and all whales are mammals then"); the exported subgraph should show whales ← mammals ← warm-blooded transitivity at layer ≥ 5.
-- Coherence test: coherent text should produce a denser, more stable subgraph than random word salad under the same token budget. (Mirrors the Exp 2 coherence finding, now as an integrated-system diagnostic.)
-- Round-trip: serialise exported graph to the `UniversalLivingGraph` JSON format, load into a TS-Core-shaped validator, confirm it round-trips.
+### Sub-phases landed
 
-**Out of scope for Phase 1:** the reverse direction (graph → LLM), concept extraction, deduplication across generations, writing directly into a live TS-Core instance.
+**Phase 1.0 (91f0068, 2026-04-16):** first cut of `ts_bridge/` — graph, exporter, head filter, smoke test, JSON round-trip.
+
+**Phase 1.1 (ac213ee):** head-classifier recalibration. The first-cut classifier frequently returned zero signal heads (fell back to averaging over all heads). Quantile-based role assignment over corpus stats now reliably splits heads into LONG_RANGE / MID_RANGE / SYNTACTIC / DIFFUSE. Added `variance_check.py` — N-prompt stability harness.
+
+**Phase 1.2 (48487b2):** corpus-level head profiling. Per-prompt `profile_and_lock` is unstable (Jaccard 0.33–0.69 between coherent prompts). `corpus_profile.py` ingests N wikitext samples, aggregates per-head stats, writes a JSON sidecar alongside the checkpoint. Downstream exporters load the sidecar via `head_override=...`. Also added `exp2_replicate.py`: the 117M-curriculum model replicates the Exp 2 coherence finding qualitatively (10/10 coherent > salad on mean τ) but at **~half the magnitude** published on 13.5M (mean-τ ratio 1.056× vs 1.25×). Published README numbers are regime-specific; the current 117M surface carries weaker raw structural signal, which constrains how aggressive downstream aggregation can be.
+
+**Phase 1.3 (55543bf):** corpus-derived edge-threshold quantiles. 0.3 was hand-picked. `corpus_profile.py` now also records quantiles (0.5 / 0.75 / 0.9 / 0.95) of aggregated τ over the corpus; `TauExporter` can be constructed from a profile sidecar and picks the threshold analytically. Makes edge-density targets explicit instead of implicit.
+
+### Phase 1.5 — Generation-time streaming export (current)
+
+The batch exporter ingests a whole forward pass; Phase 2 (graph → surface biasing) needs edges written *during* generation, one step at a time, so the graph state available to bias step t+1 already reflects step t.
+
+Deliverable: `ts_bridge/streaming.py` — `StreamingTauExporter`, subclasses `TauExporter`:
+- `prime(prompt_ids, all_tensions, tokenizer)` — batch-ingest the prompt and lock heads.
+- `ingest_step(ctx_ids, all_tensions, tokenizer, query_abs_pos)` — emit edges from the new last-position query back to its W keys only.
+- Reuses parent's head selection, threshold, node-id convention verbatim: bit-identical to batch ingest modulo positions that never become "the last query" (i.e. the trailing window that gets no forward pass after it).
+
+Open items: parity smoke test (prime + per-step stream vs full batch ingest on the same sequence), `__init__.py` re-export, hook into `generate.py`.
+
+**Out of scope for Phase 1 (deferred to Phase 2):** graph → surface biasing, concept extraction, deduplication across generations, writing directly into a live TS-Core instance.
 
 ## Phase 2 — Substrate → Surface biasing
 
