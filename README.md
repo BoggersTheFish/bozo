@@ -238,6 +238,8 @@ See [PLAN.md](./PLAN.md) for the full phase plan. Short version:
   - 1.3 — corpus-derived edge-threshold quantiles ✅
   - 1.5 — generation-time streaming exporter (`ts_bridge/streaming.py`) — current
 - **Phase 2** — Substrate → surface biasing (graph conditions generation)
+  - 2.0 — `GraphBias` + pre-sigmoid `tau_bias` plumbing through every local-attention layer; A/B smoke confirms no-op / responsiveness / directional on diagnostic checkpoint ✅
+  - 2.1 — wire streaming exporter + bias into `generate.py` for a closed-loop run; α calibration on 117M
 - **Phase 3** — Integration A/B benchmark (TensionLM + TS-Core vs Llama + TS-Core)
 - **Phase 4** — Multi-agent coherence (Wave 16 — two TS-native surfaces communicating via shared graph)
 - **Parallel** — 117M Curriculum / 350M bio runs, keeping a competent surface trained

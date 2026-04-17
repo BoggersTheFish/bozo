@@ -13,6 +13,7 @@ from .head_filter import (
 )
 from .export      import ExportStats, TauExporter
 from .streaming   import StreamStats, StreamingTauExporter
+from .bias        import BiasStats, GraphBias
 
 __all__ = [
     "Edge", "Node", "UniversalLivingGraph",
@@ -20,4 +21,5 @@ __all__ = [
     "format_profile", "profile_heads", "select_signal_heads",
     "ExportStats", "TauExporter",
     "StreamStats", "StreamingTauExporter",
+    "BiasStats", "GraphBias",
 ]

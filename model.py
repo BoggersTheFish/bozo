@@ -182,7 +182,16 @@ class MultiHeadCausalTensionLayer(nn.Module):
         self,
         x: torch.Tensor,
         return_tensions: bool = False,
+        tau_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        tau_bias : optional additive bias on the τ precursor logit (pre-sigmoid).
+                   Shape [B, T, W] for local layers, [B, T, T] for global layers.
+                   Phase 2 graph → surface biasing: add α · edge_weight to each
+                   (query, key) pair's score before the sigmoid.  Head-agnostic
+                   by construction (graph edges have no head dim) — broadcast
+                   over H inside this method.
+        """
         B, T, D = x.shape
         HD = self.head_dim
 
@@ -210,6 +219,10 @@ class MultiHeadCausalTensionLayer(nn.Module):
             scores = torch.einsum("bthd,bshd->bths", q, k) / self.scale
             # Causal mask: position t can only attend to s ≤ t
             causal = torch.tril(torch.ones(T, T, device=x.device, dtype=scores.dtype))
+            # Phase 2 bias: add α · edge_weight to precursor before sigmoid.
+            # Expect [B, T, T] (key-pos indexed on last dim); broadcast over H.
+            if tau_bias is not None:
+                scores = scores + tau_bias.unsqueeze(2).to(scores.dtype)
             tau    = torch.sigmoid(scores) * causal.unsqueeze(0).unsqueeze(2)  # B T H T
             tau_mass = tau.sum(-1).clamp(min=1e-6)                             # B T H
             msg    = torch.einsum("bths,bshd->bthd", tau, v)                  # B T H HD
@@ -228,6 +241,14 @@ class MultiHeadCausalTensionLayer(nn.Module):
         # Never materialises the B×T×H×W×HD tensor.  When return_tensions=True
         # the kernel also emits tau [B,T,H,W] directly, keeping the unfold path
         # off the hot path during aux-loss / sparse-grad / FF training.
+        #
+        # Phase 2 bias is not plumbed into the fused kernel; callers that need
+        # biasing must run on CPU or disable Triton so the unfold path runs.
+        if tau_bias is not None and self.use_triton and x.is_cuda:
+            raise NotImplementedError(
+                "tau_bias is not supported by the fused Triton kernel. "
+                "Set cfg.use_triton=False (or run on CPU) to use the unfold path."
+            )
         if self.use_triton and x.is_cuda:
             from triton_tension import causal_tension
             if return_tensions:
@@ -252,9 +273,11 @@ class MultiHeadCausalTensionLayer(nn.Module):
         nb_k = self._gather_window(k, T)  # B T H W HD
         nb_v = self._gather_window(v, T)  # B T H W HD
 
-        tau = torch.sigmoid(
-            (q.unsqueeze(3) * nb_k).sum(-1) / self.scale
-        ) * self.causal_mask[:T].unsqueeze(1)               # B T H W
+        scores = (q.unsqueeze(3) * nb_k).sum(-1) / self.scale  # B T H W
+        # Phase 2 bias: pre-sigmoid additive, head-agnostic.
+        if tau_bias is not None:
+            scores = scores + tau_bias.unsqueeze(2).to(scores.dtype)  # B T 1 W → B T H W
+        tau = torch.sigmoid(scores) * self.causal_mask[:T].unsqueeze(1)  # B T H W
 
         msg      = (tau.unsqueeze(-1) * nb_v).sum(3)        # B T H HD
         tau_mass = tau.sum(-1).clamp(min=1e-6)
@@ -328,16 +351,18 @@ class TensionBlock(nn.Module):
         return self.ffn(self._apply_osc(self.tension(self.pre_norm(x))))
 
     def _impl(
-        self, x: torch.Tensor, return_tensions: bool = False
+        self, x: torch.Tensor, return_tensions: bool = False,
+        tau_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple:
         h = self.pre_norm(x)
         if return_tensions:
-            h, tau = self.tension(h, return_tensions=True)
+            h, tau = self.tension(h, return_tensions=True, tau_bias=tau_bias)
             return self.ffn(self._apply_osc(h)), tau
-        return self.ffn(self._apply_osc(self.tension(h)))
+        return self.ffn(self._apply_osc(self.tension(h, tau_bias=tau_bias)))
 
     def forward(
-        self, x: torch.Tensor, return_tensions: bool = False
+        self, x: torch.Tensor, return_tensions: bool = False,
+        tau_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple:
         if self.use_ckpt and self.training:
             # Use a wrapper that always returns (out, tau) — avoids running the tension
@@ -345,13 +370,13 @@ class TensionBlock(nn.Module):
             # explicitly to extract tau, wasting ~30% compute + doubling VRAM per block).
             def _fn(x):
                 h = self.pre_norm(x)
-                h, tau = self.tension(h, return_tensions=True)
+                h, tau = self.tension(h, return_tensions=True, tau_bias=tau_bias)
                 return self.ffn(self._apply_osc(h)), tau
             out, tau = _grad_checkpoint(_fn, x, use_reentrant=False)
             if return_tensions:
                 return out, tau
             return out
-        return self._impl(x, return_tensions)
+        return self._impl(x, return_tensions, tau_bias=tau_bias)
 
 
 # ── TensionLM ─────────────────────────────────────────────────────────────────
@@ -414,12 +439,19 @@ class TensionLM(nn.Module):
         self,
         input_ids:  torch.Tensor,
         return_all: bool = False,
+        tau_bias:   torch.Tensor | None = None,
     ):
         """
         input_ids : LongTensor [B, T]
         return_all: if True, returns (logits, hidden, all_tensions)
                     where all_tensions is a list of [B, T, H, W] per layer.
                     All three share one computation graph.
+        tau_bias  : optional Phase-2 graph-bias tensor applied to every block's
+                    tension precursor pre-sigmoid.  Shape [B, T, W] — the same
+                    bias is broadcast across heads at every layer.  Global
+                    layers (if any) are skipped: their W-dim differs (T not W),
+                    and the graph-bias semantics for full-sequence attention
+                    are not yet defined.
         """
         B, T = input_ids.shape
         assert T <= self.cfg.max_seq_len, \
@@ -432,11 +464,14 @@ class TensionLM(nn.Module):
 
         all_tensions = []
         for block in self.blocks:
+            # Only pass bias to local-window layers; global layers need a
+            # [B, T, T] bias which we don't build in Phase 2.
+            block_bias = None if block.global_layer else tau_bias
             if return_all:
-                x, tau = block(x, return_tensions=True)
+                x, tau = block(x, return_tensions=True, tau_bias=block_bias)
                 all_tensions.append(tau)
             else:
-                x = block(x)
+                x = block(x, tau_bias=block_bias)
 
         hidden = self.final_norm(x)
         logits = self.lm_head(hidden)

@@ -90,15 +90,27 @@ Open items: parity smoke test (prime + per-step stream vs full batch ingest on t
 
 **Goal:** let the graph bias TensionLM's generation — so the substrate's current state *directly enters the attention computation*, not via prompt injection.
 
-**Mechanism:** at generation time, look up the local subgraph around recently emitted tokens. For each (query_tok, key_tok) pair, if a graph edge exists between the corresponding concepts with weight `e`, add `α · e` to the τ precursor logit before the sigmoid. Tunable α (start 0.5).
+**Mechanism:** at each (query_tok, key_tok) pair inside every local-attention layer, add `α · edge_weight(key_content, query_content)` to the τ precursor logit *before the sigmoid*. Graph edges are head-agnostic (no head dim); the bias is broadcast across heads at every layer.
 
 **Why this and not RAG:** RAG concatenates retrieved text into the prompt; the LLM has to re-derive the constraint structure from text. Graph biasing injects the constraint structure **directly into the attention mechanism**. The surface and substrate are structurally coupled, not stapled together.
 
-**Deliverable:** `ts_bridge/bias.py` + a generation wrapper that takes a `UniversalLivingGraph` and biases `generate.py`.
+### Phase 2.0 — Mechanism (landed 2026-04-17)
 
-**Validation:**
-- Contradiction test: seed the graph with a known contradiction (e.g. "whales are fish" at high weight), generate completion. Biased generation should avoid or flag the contradiction; unbiased generation should not.
-- A/B on short completions with/without graph bias, measured against human-labelled coherence.
+`ts_bridge/bias.py` (`GraphBias`) + `ts_bridge/bias_smoke.py` (A/B acceptance).  Model-side plumbing: `MultiHeadCausalTensionLayer`, `TensionBlock`, and `TensionLM` all accept an optional `tau_bias: [B, T, W]`, added pre-sigmoid in the global and unfold paths.  Triton fused kernel is out of scope for now — raises `NotImplementedError` if biased; callers run the unfold fallback (CPU or `use_triton=False`).
+
+`GraphBias.from_graph(graph, alpha)` builds a content-addressed edge map (strips position suffixes, aggregates by max — concept-level stand-in until the concept-extraction pass lands).  `local_bias(ctx_ids, tokenizer, window)` returns the aligned `[B, T, W]` tensor following the same (query, key) convention as `TauExporter.ingest`.
+
+Acceptance (`bias_smoke` on `checkpoints/diagnostic/latest.pt`, dim=512, 12L, 8H, W=64, α=2.0):
+- **No-op invariant** — empty graph ⇒ Δlogit = 0.0 (exact).
+- **Responsiveness** — single seeded edge ⇒ KL(biased ‖ unbiased) ≈ 1.7 × 10⁻² at the last position.
+- **Directional** — two different seeded edges ⇒ KL(A ‖ B) ≈ 2.6 × 10⁻¹.  The bias pathway transmits *which* edge, not just "something is biased."
+
+### Phase 2.1 and beyond (not yet landed)
+
+- Hook `StreamingTauExporter` + `GraphBias` into `generate.py` so the graph updates every step and feeds back into attention on the next step (closed loop).
+- α calibration against 117M-curriculum's weaker raw-τ coherence signal (~1.056× vs 13.5M's 1.25×) — Phase 1.2 replication flagged this.
+- Global-layer bias path (`[B, T, T]` shape, full-sequence semantics).
+- Fused-kernel bias path (Triton precursor-add before sigmoid).
 
 ## Phase 3 — Integration A/B (the real paper experiment)
 
