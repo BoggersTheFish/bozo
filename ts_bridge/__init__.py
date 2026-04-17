@@ -12,10 +12,12 @@ from .head_filter import (
     format_profile, profile_heads, select_signal_heads,
 )
 from .export      import ExportStats, TauExporter
+from .streaming   import StreamStats, StreamingTauExporter
 
 __all__ = [
     "Edge", "Node", "UniversalLivingGraph",
     "HeadRole", "HeadStat",
     "format_profile", "profile_heads", "select_signal_heads",
     "ExportStats", "TauExporter",
+    "StreamStats", "StreamingTauExporter",
 ]
