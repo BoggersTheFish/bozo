@@ -437,21 +437,24 @@ class TensionLM(nn.Module):
 
     def forward(
         self,
-        input_ids:  torch.Tensor,
-        return_all: bool = False,
-        tau_bias:   torch.Tensor | None = None,
+        input_ids:       torch.Tensor,
+        return_all:      bool = False,
+        tau_bias:        torch.Tensor | None = None,
+        tau_bias_global: torch.Tensor | None = None,
     ):
         """
-        input_ids : LongTensor [B, T]
-        return_all: if True, returns (logits, hidden, all_tensions)
-                    where all_tensions is a list of [B, T, H, W] per layer.
-                    All three share one computation graph.
-        tau_bias  : optional Phase-2 graph-bias tensor applied to every block's
-                    tension precursor pre-sigmoid.  Shape [B, T, W] — the same
-                    bias is broadcast across heads at every layer.  Global
-                    layers (if any) are skipped: their W-dim differs (T not W),
-                    and the graph-bias semantics for full-sequence attention
-                    are not yet defined.
+        input_ids       : LongTensor [B, T]
+        return_all      : if True, returns (logits, hidden, all_tensions)
+                          where all_tensions is a list of [B, T, H, W] per layer.
+                          All three share one computation graph.
+        tau_bias        : optional Phase-2 graph-bias tensor applied to every
+                          local-window block's tension precursor pre-sigmoid.
+                          Shape [B, T, W] — broadcast across heads.
+        tau_bias_global : optional graph-bias tensor for global-attention
+                          blocks (when cfg.global_every > 0).  Shape [B, T, T]
+                          — broadcast across heads.  If None, global layers
+                          run unbiased.  Pass both when biasing a model with
+                          interleaved global layers.
         """
         B, T = input_ids.shape
         assert T <= self.cfg.max_seq_len, \
@@ -464,9 +467,7 @@ class TensionLM(nn.Module):
 
         all_tensions = []
         for block in self.blocks:
-            # Only pass bias to local-window layers; global layers need a
-            # [B, T, T] bias which we don't build in Phase 2.
-            block_bias = None if block.global_layer else tau_bias
+            block_bias = tau_bias_global if block.global_layer else tau_bias
             if return_all:
                 x, tau = block(x, return_tensions=True, tau_bias=block_bias)
                 all_tensions.append(tau)

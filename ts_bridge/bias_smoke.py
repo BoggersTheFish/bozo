@@ -5,21 +5,29 @@ ts_bridge.bias_smoke
 Phase 2 acceptance: the graph-bias path actually enters TensionLM's
 attention computation and measurably moves next-token logits.
 
-Three checks
-------------
-1. **No-op invariant.**  Empty graph ⇒ bias is all zeros ⇒ biased logits
-   must equal unbiased logits.  Catches plumbing regressions immediately.
+Checks
+------
+1. **Local no-op invariant.**  Empty graph ⇒ bias is all zeros ⇒ biased
+   logits must equal unbiased logits.  Catches plumbing regressions.
 
-2. **Responsiveness.**  Seed the graph with a strong edge between tokens
-   that both appear in the prompt.  The biased forward's τ field at the
-   matched (query, key) pair will rise pre-sigmoid, changing downstream
-   hidden states and thus the last-position logits.  We expect a
-   non-trivial KL divergence between biased and unbiased next-token
-   distributions.
+2. **Local responsiveness.**  Seed the graph with a strong edge between
+   tokens that both appear in the prompt.  The biased forward's τ field
+   at the matched (query, key) pair rises pre-sigmoid, changing the
+   last-position logits.
 
-3. **Directional.**  Two different seeded edges (A→B vs A→C) should
-   produce two different biased distributions.  Confirms the bias
-   pathway transmits which edge, not just "something is biased."
+3. **Local directional.**  Two different seeded edges (A→B vs A→C) should
+   produce different biased distributions.  Confirms the bias pathway
+   transmits which edge, not just "something is biased."
+
+Additional global-layer checks fire when cfg.global_every > 0:
+
+4. **Global no-op invariant.**  tau_bias_global=zeros must equal
+   tau_bias_global=None.  Proves the [B, T, T] path is plumbed.
+
+5. **Global responsiveness.**  A [B, T, T] bias built from the same
+   seeded edge as check (2), passed alone (local=None), must move the
+   last-position logits.  Proves the global-only path actually reaches
+   the global layers' score tensors.
 
 This is a mechanism test, not a truth test.  Phase 2 only claims the
 graph can enter attention; whether a *truthful* graph produces *better*
@@ -73,10 +81,14 @@ def _seed_graph(pairs: list[tuple[str, str, float]]) -> UniversalLivingGraph:
 
 
 @torch.no_grad()
-def run_forward(model, ctx_tensor: torch.Tensor,
-                bias: torch.Tensor | None) -> torch.Tensor:
+def run_forward(
+    model,
+    ctx_tensor:  torch.Tensor,
+    bias:        torch.Tensor | None = None,
+    bias_global: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Return last-position logits [vocab]."""
-    out = model(ctx_tensor, tau_bias=bias)
+    out = model(ctx_tensor, tau_bias=bias, tau_bias_global=bias_global)
     return out[0, -1].float()
 
 
@@ -122,40 +134,68 @@ def main():
 
     ctx = torch.tensor(ids, dtype=torch.long, device=args.device).unsqueeze(0)
 
-    # ── 1. No-op invariant ──────────────────────────────────────────────────
-    logits_unbiased = run_forward(model, ctx, None)
+    # ── 1. Local no-op invariant ────────────────────────────────────────────
+    logits_unbiased = run_forward(model, ctx)
     bias_zero = torch.zeros(1, T, W, device=args.device)
-    logits_zero = run_forward(model, ctx, bias_zero)
+    logits_zero = run_forward(model, ctx, bias=bias_zero)
     noop_gap = (logits_unbiased - logits_zero).abs().max().item()
-    print(f"\n[1] no-op invariant: max|Δlogit| = {noop_gap:.2e}   "
+    print(f"\n[1] local no-op invariant: max|Δlogit| = {noop_gap:.2e}   "
           f"{'✓' if noop_gap < 1e-5 else '✗'}")
 
-    # ── 2. Responsiveness ───────────────────────────────────────────────────
+    # ── 2. Local responsiveness ─────────────────────────────────────────────
     graph_A = _seed_graph([(src_A, dst_tok, args.edge_weight)])
-    bias_A, stats_A = GraphBias.from_graph(graph_A, alpha=args.alpha).local_bias(
+    engine_A = GraphBias.from_graph(graph_A, alpha=args.alpha)
+    bias_A, stats_A = engine_A.local_bias(
         ids, tokenizer, window=W, device=args.device,
     )
-    logits_A = run_forward(model, ctx, bias_A)
+    logits_A = run_forward(model, ctx, bias=bias_A)
     kl_A = _kl(logits_A, logits_unbiased)
-    print(f"\n[2] responsiveness:  edge '{src_A}'→'{dst_tok}' "
+    print(f"\n[2] local responsiveness: edge '{src_A}'→'{dst_tok}' "
           f"w={args.edge_weight} α={args.alpha}")
     print(f"    bias hits={stats_A.nonzero_pairs}  "
           f"max={stats_A.max_weight:.2f}  mean={stats_A.mean_weight:.2f}")
     print(f"    KL(biased||unbiased) at last pos = {kl_A:.4e}   "
           f"{'✓' if kl_A > 1e-6 else '✗'}")
 
-    # ── 3. Directional ──────────────────────────────────────────────────────
+    # ── 3. Local directional ────────────────────────────────────────────────
     graph_B = _seed_graph([(src_B, dst_tok, args.edge_weight)])
-    bias_B, stats_B = GraphBias.from_graph(graph_B, alpha=args.alpha).local_bias(
+    engine_B = GraphBias.from_graph(graph_B, alpha=args.alpha)
+    bias_B, stats_B = engine_B.local_bias(
         ids, tokenizer, window=W, device=args.device,
     )
-    logits_B = run_forward(model, ctx, bias_B)
+    logits_B = run_forward(model, ctx, bias=bias_B)
     kl_AB = _kl(logits_A, logits_B)
-    print(f"\n[3] directional:     edge '{src_B}'→'{dst_tok}' "
-          f"vs edge A")
+    print(f"\n[3] local directional:    edge '{src_B}'→'{dst_tok}' vs edge A")
     print(f"    bias hits={stats_B.nonzero_pairs}  max={stats_B.max_weight:.2f}")
     print(f"    KL(A||B) at last pos = {kl_AB:.4e}   "
           f"{'✓' if kl_AB > 1e-6 else '✗'}")
+
+    # ── Global-layer checks (only when the model has global layers) ────────
+    global_ok = True
+    if cfg.global_every > 0:
+        # [4] Global no-op invariant.
+        bias_g_zero = torch.zeros(1, T, T, device=args.device)
+        logits_g_zero = run_forward(model, ctx, bias_global=bias_g_zero)
+        noop_gap_g = (logits_unbiased - logits_g_zero).abs().max().item()
+        print(f"\n[4] global no-op invariant: max|Δlogit| = {noop_gap_g:.2e}   "
+              f"{'✓' if noop_gap_g < 1e-5 else '✗'}")
+
+        # [5] Global-only responsiveness — same seeded edge as [2], built as
+        # [B, T, T] and passed without any local bias.
+        bias_A_g, stats_A_g = engine_A.global_bias(
+            ids, tokenizer, device=args.device,
+        )
+        logits_A_g = run_forward(model, ctx, bias_global=bias_A_g)
+        kl_A_g = _kl(logits_A_g, logits_unbiased)
+        print(f"\n[5] global responsiveness (global-only, local=None):")
+        print(f"    bias hits={stats_A_g.nonzero_pairs}  "
+              f"max={stats_A_g.max_weight:.2f}  mean={stats_A_g.mean_weight:.2f}")
+        print(f"    KL(global_biased||unbiased) at last pos = {kl_A_g:.4e}   "
+              f"{'✓' if kl_A_g > 1e-6 else '✗'}")
+
+        global_ok = noop_gap_g < 1e-5 and kl_A_g > 1e-6
+    else:
+        print("\n[4-5] global checks skipped: cfg.global_every == 0")
 
     # ── Top-k diff under edge A ─────────────────────────────────────────────
     def _top(logits):
@@ -170,7 +210,7 @@ def main():
     print("  bias A   : ", ", ".join(f"{t} ({p:.3f})" for t, p in _top(logits_A)))
     print("  bias B   : ", ", ".join(f"{t} ({p:.3f})" for t, p in _top(logits_B)))
 
-    ok = (noop_gap < 1e-5) and (kl_A > 1e-6) and (kl_AB > 1e-6)
+    ok = (noop_gap < 1e-5) and (kl_A > 1e-6) and (kl_AB > 1e-6) and global_ok
     print(f"\n{'✓ Phase 2 bias mechanism OK' if ok else '✗ Phase 2 bias FAILED'}")
     sys.exit(0 if ok else 1)
 

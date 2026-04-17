@@ -48,10 +48,10 @@ schema flagged as out-of-scope.  Once concepts exist, swap the key from
 Global layers
 -------------
 Global-attention layers use a [B, T, T] bias shape and different semantics
-(all past tokens, not a window).  This module only produces local biases;
-`TensionLM.forward` already skips bias-passing on global blocks.  Graph
-biasing for global layers is a followup when the signal mechanism is
-validated on local ones.
+(all past tokens, not a window).  `global_bias` builds the [B, T, T]
+counterpart to `local_bias`: bias[b, t, s] = α · edge_weight(ctx[s], ctx[t])
+for s < t, zero otherwise.  `TensionLM.forward` takes it via the
+`tau_bias_global` kwarg; callers can pass local, global, or both.
 """
 
 from __future__ import annotations
@@ -163,6 +163,63 @@ class GraphBias:
                     continue
                 boost = self.alpha * weight
                 bias[:, t, w] = boost
+                hits    += 1
+                total_w += weight
+                if weight > max_w:
+                    max_w = weight
+
+        stats = BiasStats(
+            nonzero_pairs = hits,
+            max_weight    = max_w,
+            mean_weight   = total_w / hits if hits else 0.0,
+        )
+        return bias, stats
+
+    def global_bias(
+        self,
+        ctx_ids:    Sequence[int],
+        tokenizer,
+        batch:      int = 1,
+        device:     torch.device | str = "cpu",
+        dtype:      torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, BiasStats]:
+        """
+        Build a [B, T, T] tensor of α · edge_weight values for the full-
+        sequence (global) attention path.
+
+            bias[b, t, s] = α · edge_weight(
+                from = ctx_content[s],
+                to   = ctx_content[t],
+            )   for  s < t
+
+        Zero for s ≥ t (no self-bias, and the causal mask inside the model
+        zeros out s > t anyway).  Shape matches TensionLM's global-layer
+        score tensor on its last dim, and is broadcast over H inside the
+        layer.
+
+        O(T²) Python loop; fine at T ≤ 2048 but a candidate for
+        vectorisation if global-layer biasing becomes a hot path.
+        """
+        T = len(ctx_ids)
+
+        contents = [
+            tokenizer.id_to_token(int(tid)) or f"<{int(tid)}>"
+            for tid in ctx_ids
+        ]
+
+        bias = torch.zeros((batch, T, T), dtype=dtype, device=device)
+        hits = 0
+        total_w = 0.0
+        max_w   = 0.0
+
+        for t in range(T):
+            dst_c = contents[t]
+            for s in range(t):
+                weight = self.edge_map.get((contents[s], dst_c), 0.0)
+                if weight <= 0.0:
+                    continue
+                boost = self.alpha * weight
+                bias[:, t, s] = boost
                 hits    += 1
                 total_w += weight
                 if weight > max_w:

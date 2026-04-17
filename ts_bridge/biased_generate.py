@@ -148,12 +148,20 @@ def closed_loop_generate(
 
         # Build bias from the current graph (cheap rebuild per step).
         bias_engine = GraphBias.from_graph(graph, alpha=alpha)
-        bias, _ = bias_engine.local_bias(
+        bias_local, _ = bias_engine.local_bias(
             ctx, tokenizer, window=W, device=device,
         )
+        # Only build the [B, T, T] global bias when the model actually has
+        # global layers — it's O(T²) work that would otherwise be wasted.
+        bias_global = None
+        if cfg.global_every > 0:
+            bias_global, _ = bias_engine.global_bias(
+                ctx, tokenizer, device=device,
+            )
 
         logits, _, all_tau_biased = model(
-            ctx_tensor, return_all=True, tau_bias=bias,
+            ctx_tensor, return_all=True,
+            tau_bias=bias_local, tau_bias_global=bias_global,
         )
 
         # Export edges ending at current last position (if new).
