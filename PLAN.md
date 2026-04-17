@@ -1,213 +1,237 @@
 # TensionLM — Development Plan
 
-## What TensionLM is (and isn't)
+## Goal
 
-TensionLM is the **TS-native language surface** for the Thinking System. Not a standalone LLM competing with transformers. Not a reasoning engine in its own right. A surface whose internal representation is already a constraint graph, so it can be coupled bidirectionally to the external graph that actually does the thinking.
+Build a language model using sigmoid tension as the core attention mechanism, targeting **mathematical and code reasoning**. The architecture is TS-inspired: attention as constraint relaxation over a graph of interdependent states. Formal domains — mathematics and code — are the ideal training targets: contradictions cannot exist by construction, so the constraint graph built during training is coherent by definition.
 
-Three-layer TS architecture:
+**Why formal domains:** General web text creates irresolvable constraint loops (contradictory documents). Formal domains have enforced consistency. A model trained on formal data builds a constraint graph that is coherent by construction — exactly what TS predicts should produce structured, inspectable reasoning.
 
-| Layer | Role | Implementation |
-|-------|------|----------------|
-| **Substrate** | Constraint graph — where thinking happens | `TS-Core` / `UniversalLivingGraph`, wave-cycle propagation |
-| **Surface** | Fluent language on top of settled graph state | **TensionLM** (this repo) — replaces generic LLM surface |
-| **Grounding** | Closed-loop learning from high-confidence traces | QLoRA fine-tune in `BoggersTheAI/core/fine_tuner.py` |
+**The invariant:** Token pairs are always scored independently. No position is suppressed because another scored higher. The model learns which constraints matter without being forced to forget other constraints in the same step.
 
-## The thesis
+---
 
-> A language model whose attention mechanism is already a constraint graph, paired bidirectionally with an external constraint graph, eliminates the substrate-surface representational mismatch that forces traditional LLM+KG systems into hallucination.
+## What we know from completed experiments
 
-The surface and the substrate speak the same representational language (sigmoid tension ≙ weighted edges). They are not a retriever bolted onto a decoder. They are one coherent graph running on two scales.
+### Mechanism validation (Exp 1 — 1.1M params)
+Sigmoid tension matches transformer at identical parameter count (val PPL 57.7 vs 57.8). The mechanism works.
 
-## What existing TensionLM experiments establish
+### TS-native objectives (Exp 2 — 13.5M params)
+Constraint consistency + tension entropy losses cost 1.31 PPL but produce structurally coherent constraint graphs. Transitivity chains are directly visible in the tension field. Coherent text produces +25% mean τ and +60% more active edges than word salad — the graph measurably responds to coherence exactly as TS predicts.
 
-Prior results (see README) validate that TensionLM is a **viable TS-native surface**:
+### Curriculum training (Exp 3 — 13.5M params)
+Logic → language → maths. First-contact maths PPL: cold start ~2293, logic only ~1076, logic+language ~582. 4× better than cold start. Curriculum validated.
 
-- **Mechanism parity** (Exp 1, 1.1M) — sigmoid tension ties transformer PPL. The surface isn't broken.
-- **Constraint graphs form** (Exp 2, 13.5M) — TS-native losses produce visible transitivity chains; coherent text produces +25% mean τ / +60% more active edges vs word salad. The τ field measurably responds to coherence.
-- **Curriculum validates the surface ordering** (Exp 3, 4) — logic → language → maths produces 4× first-contact improvement at 13.5M, 96× at 117M. Building the graph *first*, language *second*, matches the TS doctrine (substrate precedes surface).
-- **Constraint interference is real and predicted** (Exp 5) — step-14k outperforms the final checkpoint because epoch-2 dense maths constraints displace stage-1 logic structure. This is a direct TS prediction that got empirically confirmed.
+### 117M curriculum run (Exp 4)
+- Stage 1 logic (200M tokens): val PPL 5.10
+- Stage 2 language FineWeb-Edu (500M tokens): val PPL 339
+- Stage 3 maths open-web-math (2B tokens): best val PPL **359.99 at step 14,000**, min train PPL **6.8**
+- First-contact train PPL: **24** vs ~2293 cold start — **96× better**
 
-What none of this establishes: whether coupling TensionLM to the TS-Core graph **actually improves the integrated system**. That's the next phase.
+### Formal reasoning eval (Exp 5 — 23 questions, step 14k)
+- Overall: **43.5%** — algebra 67%, calculus 50%, arithmetic 50%, transitivity 33%, syllogisms 17%
+- Critical finding: **step 14,000 beats the final checkpoint** — epoch 2 of maths data partially overwrites stage 1 logic structure. Any new training must prevent this.
 
-## Phase 0 — Kernel unblock (complete 2026-04-16)
+### Tension field (117M)
+- `Manchester:0.95 United:0.95` simultaneously — impossible in softmax
+- Syllogism: both logical subjects at equal full strength simultaneously
+- Head specialisation (syntactic / long-range semantic / diffuse) emerges without supervision
 
-Fused Triton kernel now optionally emits `tau[B,T,H,W]` directly, so `return_tensions=True` stays on the fused path instead of falling through to the unfold gather. 350M preset fits in 11 GB peak (previously OOM'd at 24 GB). All τ consumers downstream — aux losses, sparse-grad gate, FF goodness, and now graph export — are unblocked.
+### Replication at 117M (Phase 1.2 sidebar)
+The Exp 2 coherence response replicates qualitatively on 117M-Curriculum (10/10 coherent prompts > word salad on mean τ) but at ~half the magnitude (1.056× vs published 1.25× on 13.5M). Published numbers are regime-specific; the structural signal is present but weaker at 117M, which disciplines our claims about raw-τ coherence on the larger model.
 
-| Metric | Before | After |
-|--------|--------|-------|
-| 350M fwd+bwd peak | OOM (> 24 GB) | 10.9 GB |
-| 350M + FF (double fwd) peak | OOM | 20.0 GB |
-| Tau path memory (per layer, 350M dims) | 2.1 GB unfold gather | 126 MB fused |
+---
 
-## Phase 1 — Surface → Substrate export (in flight)
+## Completed phases
 
-**Goal:** build a clean interface that turns TensionLM's internal tension field into weighted edges on a `UniversalLivingGraph`-shaped target, token by token during generation.
+| Phase | Status | Key result |
+|-------|--------|-----------|
+| Proof of concept | ✓ | Mechanism validated at 1.1M |
+| Baseline comparison | ✓ | PPL 57.7 vs 57.8 |
+| TS-native objectives | ✓ | Coherent constraint graphs, +25% τ density |
+| Curriculum training 13.5M | ✓ | 4× first-contact improvement |
+| Architecture upgrades | ✓ | RoPE, tau-mass norm, global layers, Triton |
+| 117M curriculum run | ✓ | Train PPL 6.8, formal eval 43.5% |
+| Efficiency fixes | ✓ | ~2-3× training throughput on 2× 4090 |
+| Kernel unblock (Phase 0) | ✓ | Fused Triton emits τ directly; 350M fits in 11 GB |
 
-**Why first:** without this, everything about the integrated thesis is vapour. This is the shortest path from the current repo state to a verifiable integration artefact. Does *not* require TS-Core to be present — we target the graph shape, keep the implementation local, and make the shape trivially mergeable into TS-Core later.
+---
 
-**Deliverable:** `ts_bridge/` package in this repo:
-- `ts_bridge/graph.py` — minimal graph shape compatible with `TS-Core/UniversalLivingGraph` (node: content, topics, activation, stability; edge: src, dst, weight, relation). Dict-backed for now.
-- `ts_bridge/export.py` — `TauExporter` that hooks TensionLM and emits edges from a batched forward pass.
-- `ts_bridge/head_filter.py` — head-specialisation filter; only layers/heads classified long-range-semantic produce graph edges (syntactic-tracking heads are noise at the graph level).
-- `ts_bridge/corpus_profile.py` — corpus-level head profile, written once per checkpoint (see 1.2 below).
-- `ts_bridge/exp2_replicate.py` — 117M raw-τ replication of the Exp 2 coherence finding.
-- `ts_bridge/variance_check.py` — multi-prompt stability test for the exporter.
-- `ts_bridge/streaming.py` — per-step exporter for autoregressive generation (Phase 1.5, current).
-- `ts_bridge/schema.md` — the interface contract. Once stable, this is what goes into TS-Core.
+## Current phase — Math + Code Reasoning Model
 
-**Edge extraction:**
-- For each generated token `t`, collect τ[layer, head, t, w] across all local-attention layers.
-- Filter to heads tagged `LONG_RANGE` (and optionally `MID_RANGE`) by the head classifier. Lock the head set from a **corpus-level** profile, not per-prompt (per-prompt locking is content-unstable — Jaccard 0.33–0.69 across prompts).
-- Aggregate: `edge_weight(t, t-w-1) = mean over selected heads of τ[·, ·, t, w]`.
-- Threshold: `edge_threshold` defaults to the 0.75 quantile of aggregated τ under a corpus-derived calibration (see 1.3 below); 0.3 is the hand-picked legacy default.
-- Node content = decoded token (pending a concept-extraction pass later).
-- Activation seeded from the aggregated pull; stability left at the `UniversalLivingGraph` default (0.5).
+**Target:** a TensionLM model that demonstrably outperforms an equivalent transformer on mathematical and code reasoning, with interpretable constraint structure as a first-class output.
 
-### Sub-phases landed
+### Architecture changes from 117M baseline
 
-**Phase 1.0 (91f0068, 2026-04-16):** first cut of `ts_bridge/` — graph, exporter, head filter, smoke test, JSON round-trip.
+| Parameter | 117M baseline | New run |
+|-----------|--------------|---------|
+| vocab_size | 32,768 | 50,257 (GPT-2 tokenizer) |
+| window W | 64 | 256 |
+| global_every | 4 | 3 |
+| logic_mix in stage 3 | 0 | 0.10 |
+| max_seq_len | 1024 | 2048 |
 
-**Phase 1.1 (ac213ee):** head-classifier recalibration. The first-cut classifier frequently returned zero signal heads (fell back to averaging over all heads). Quantile-based role assignment over corpus stats now reliably splits heads into LONG_RANGE / MID_RANGE / SYNTACTIC / DIFFUSE. Added `variance_check.py` — N-prompt stability harness.
+**Why these changes:**
+- vocab=50k: GPT-2 tokenizer is well-tested, compatible with existing maths and code corpora tokenisation
+- W=256: Proofs and multi-function code regularly require attending back 500+ tokens. W=64 was the primary architectural bottleneck for real formal reasoning.
+- global_every=3: More frequent long-range passes without O(T²) cost everywhere
+- logic_mix=0.10: Directly addresses the catastrophic forgetting finding. 10% logic data throughout stage 3 keeps constraint structure active.
 
-**Phase 1.2 (48487b2):** corpus-level head profiling. Per-prompt `profile_and_lock` is unstable (Jaccard 0.33–0.69 between coherent prompts). `corpus_profile.py` ingests N wikitext samples, aggregates per-head stats, writes a JSON sidecar alongside the checkpoint. Downstream exporters load the sidecar via `head_override=...`. Also added `exp2_replicate.py`: the 117M-curriculum model replicates the Exp 2 coherence finding qualitatively (10/10 coherent > salad on mean τ) but at **~half the magnitude** published on 13.5M (mean-τ ratio 1.056× vs 1.25×). Published README numbers are regime-specific; the current 117M surface carries weaker raw structural signal, which constrains how aggressive downstream aggregation can be.
+### Data plan
 
-**Phase 1.3 (55543bf):** corpus-derived edge-threshold quantiles. 0.3 was hand-picked. `corpus_profile.py` now also records quantiles (0.5 / 0.75 / 0.9 / 0.95) of aggregated τ over the corpus; `TauExporter` can be constructed from a profile sidecar and picks the threshold analytically. Makes edge-density targets explicit instead of implicit.
+| Stage | Dataset | Tokens | Purpose |
+|-------|---------|--------|---------|
+| 1 — Logic | Synthetic inference (existing `data/logic-stage1`) | 200M | Load constraint structure |
+| 2 — Formal language | Lean4 proofs + ProofPile + ArXiv maths abstracts | 500M | Mathematical language without notation overload |
+| 3 — Math + code | open-web-math + MATH + The Stack (Python, Lean, Coq) + logic_mix=0.10 | 5B | Formal reasoning across maths and code; logic mix prevents forgetting |
 
-### Phase 1.5 — Generation-time streaming export (current)
+**Why ProofPile for stage 2:** Formal proofs have explicit constraint chains — every step references previous steps. This is ideal TS-aligned data: maximally consistent, maximally structured. Better than FineWeb-Edu which mixes in general educational text.
 
-The batch exporter ingests a whole forward pass; Phase 2 (graph → surface biasing) needs edges written *during* generation, one step at a time, so the graph state available to bias step t+1 already reflects step t.
+**Why code in stage 3:** Code is formally verifiable constraint-chain data at scale. Python typing, Lean/Coq proofs, and well-typed codebases are dense in the kind of dependency structure sigmoid-tension attention is designed to represent. The mechanism should show particular advantages on code once enough is mixed in.
 
-Deliverable: `ts_bridge/streaming.py` — `StreamingTauExporter`, subclasses `TauExporter`:
-- `prime(prompt_ids, all_tensions, tokenizer)` — batch-ingest the prompt and lock heads.
-- `ingest_step(ctx_ids, all_tensions, tokenizer, query_abs_pos)` — emit edges from the new last-position query back to its W keys only.
-- Reuses parent's head selection, threshold, node-id convention verbatim: bit-identical to batch ingest modulo positions that never become "the last query" (i.e. the trailing window that gets no forward pass after it).
+### Training plan
 
-Open items: parity smoke test (prime + per-step stream vs full batch ingest on the same sequence), `__init__.py` re-export, hook into `generate.py`.
+```bash
+# Stage 1 — logic (reuse existing checkpoint if available)
+torchrun --nproc_per_node=2 train.py \
+  --data_dir data/logic-stage1 \
+  --train_tokens 200_000_000 \
+  --preset large \
+  --window 256 \
+  --max_seq_len 2048 \
+  --vocab_size 50257 \
+  --w_consistency 0.1 --w_entropy 0.05 \
+  --global_every 3 \
+  --out_dir checkpoints/math_stage1
 
-**Out of scope for Phase 1 (deferred to Phase 2):** graph → surface biasing, concept extraction, deduplication across generations, writing directly into a live TS-Core instance.
+# Stage 2 — formal language
+torchrun --nproc_per_node=2 train.py \
+  --data_dir data/proofpile \
+  --train_tokens 500_000_000 \
+  --preset large \
+  --window 256 \
+  --max_seq_len 2048 \
+  --vocab_size 50257 \
+  --global_every 3 \
+  --resume --out_dir checkpoints/math_stage2
 
-## Phase 2 — Substrate → Surface biasing
+# Stage 3 — full maths + code with logic mixing
+torchrun --nproc_per_node=2 train.py \
+  --data_dir data/open-web-math \
+  --train_tokens 5_000_000_000 \
+  --preset large \
+  --window 256 \
+  --max_seq_len 2048 \
+  --vocab_size 50257 \
+  --global_every 3 \
+  --logic_mix 0.10 \
+  --logic_dir data/logic-stage1 \
+  --w_consistency 0.05 \
+  --resume --out_dir checkpoints/math_stage3
+```
 
-**Goal:** let the graph bias TensionLM's generation — so the substrate's current state *directly enters the attention computation*, not via prompt injection.
+### Evaluation
 
-**Mechanism:** at each (query_tok, key_tok) pair inside every local-attention layer, add `α · edge_weight(key_content, query_content)` to the τ precursor logit *before the sigmoid*. Graph edges are head-agnostic (no head dim); the bias is broadcast across heads at every layer.
+Beyond perplexity, the model will be evaluated on:
 
-**Why this and not RAG:** RAG concatenates retrieved text into the prompt; the LLM has to re-derive the constraint structure from text. Graph biasing injects the constraint structure **directly into the attention mechanism**. The surface and substrate are structurally coupled, not stapled together.
+1. **Extended formal reasoning benchmark** — expand the existing 23-question set to 100+ questions across: syllogisms, arithmetic, algebra, calculus, linear algebra, proof by contradiction, induction
+2. **MATH dataset subset** — 500 problems across difficulty levels 1-5
+3. **HumanEval / MBPP** — Python code completion as the first code-reasoning signal
+4. **Tension field quality** — constraint transitivity score, head specialisation index, coherence ratio (coherent text τ density / random τ density)
+5. **Forgetting metric** — formal reasoning score at step 2k, 5k, 10k, 20k, 50k — track whether logic_mix prevents the step-14k degradation seen in the baseline run
 
-### Phase 2.0 — Mechanism (landed 2026-04-17)
+---
 
-`ts_bridge/bias.py` (`GraphBias`) + `ts_bridge/bias_smoke.py` (A/B acceptance).  Model-side plumbing: `MultiHeadCausalTensionLayer`, `TensionBlock`, and `TensionLM` all accept an optional `tau_bias: [B, T, W]`, added pre-sigmoid in the global and unfold paths.  Triton fused kernel is out of scope for now — raises `NotImplementedError` if biased; callers run the unfold fallback (CPU or `use_triton=False`).
+## Biological-training track (parallel)
 
-`GraphBias.from_graph(graph, alpha)` builds a content-addressed edge map (strips position suffixes, aggregates by max — concept-level stand-in until the concept-extraction pass lands).  `local_bias(ctx_ids, tokenizer, window)` returns the aligned `[B, T, W]` tensor following the same (query, key) convention as `TauExporter.ingest`.
+350M runs use the "biological" training machinery already in `train.py`:
+- `--decouple_optim` — separate consolidation / plastic-window optimisers
+- `--sparse_grad` — activity-gated weight updates
+- `--sleep_every` — periodic consolidation passes
+- `--ff_mode` — forward-forward contrastive objective alongside cross-entropy
 
-Acceptance (`bias_smoke` on `checkpoints/diagnostic/latest.pt`, dim=512, 12L, 8H, W=64, α=2.0):
-- **No-op invariant** — empty graph ⇒ Δlogit = 0.0 (exact).
-- **Responsiveness** — single seeded edge ⇒ KL(biased ‖ unbiased) ≈ 1.7 × 10⁻² at the last position.
-- **Directional** — two different seeded edges ⇒ KL(A ‖ B) ≈ 2.6 × 10⁻¹.  The bias pathway transmits *which* edge, not just "something is biased."
+These are TS-inspired weight-update operations (consolidation / contrast / plastic-window); ablations so far suggest they stabilise long training runs. Kept as a parallel experimental track.
 
-### Phase 2.1 — Closed-loop generation (landed 2026-04-17)
+**350M stage 1 (bio)** — relaunch with the Phase 0 kernel fix. Stage 1 on synthetic logic (200M tokens).
+**350M stage 2 (bio)** — `run_stage2_350m.sh` — open-web-math 1.1B tokens with `--logic_mix 0.10` plus biological machinery.
 
-`ts_bridge/biased_generate.py` wires `StreamingTauExporter` and `GraphBias` into a single step-wise loop: build bias from the current graph → forward with `tau_bias` → `ingest_step` writes edges ending at the new last position back into the same graph → sample → repeat.  The surface and substrate are in bidirectional feedback during generation.
+---
 
-Sampling mirrors `model.generate` (nucleus + rep penalty) so biased vs unbiased runs are directly comparable.  An `--ab` flag runs both sides on the same seed.
+## Next phase — Scale to 1B
 
-Acceptance (`biased_generate --ab` on `checkpoints/diagnostic/latest.pt`, α=1.0, seed=42, 20 generated tokens, prompt *"If all mammals are warm-blooded and all whales are mammals then"*):
+After the math+code reasoning model is validated:
 
-    biased    : "... then the set is non-emptyemptyemptyemptyempty..."
-    unbiased  : "... then the node is non-emptyemptyemptyemptyempty..."
-    diverge at generated-token index 1 / 20
-    biased graph: 39 nodes / 702 edges, mean w=0.560
+| Run | Params | Window | Tokens | Hardware | Est. cost |
+|-----|--------|--------|--------|----------|-----------|
+| Math+code reasoning | 117M | 256 | 5.7B | 2× 4090 | ~$0 (own) |
+| Ablation: W=64 vs W=256 | 117M | both | 1B each | 2× 4090 | ~$50 |
+| Scale-up | 1B | 512 | 100B | 8× A100 (vast.ai) | ~$3,000 |
 
-The diagnostic checkpoint is weak (synthetic-logic small-scale surface), so the text quality is low on both sides — but the divergence at the first generated token under identical sampling seed confirms the loop closes: graph state influences which token gets emitted, and the next step's graph state includes the edges the previous step just wrote.
+---
 
-### Phase 2.2 and beyond (not yet landed)
+## Open questions to answer with this run
 
-- α calibration sweep on 117M-curriculum — raw-τ coherence is ~1.056× vs 13.5M's 1.25× (Phase 1.2 replication), so the bias has less headroom and α needs tuning on the real surface.
-- Global-layer bias path (`[B, T, T]` shape, full-sequence semantics).
-- Fused-kernel bias path (Triton precursor-add before sigmoid; currently unbiased callers must run the unfold fallback).
-- Export-of-post-bias-τ is a positive feedback loop by design — add a `--export_mode unbiased` that runs a second tau-bias-free forward for the export path only, when a cleaner graph snapshot is wanted.
+1. Does logic_mix=0.10 prevent the step-14k degradation? (Track formal eval every 5k steps)
+2. Does W=256 meaningfully improve multi-step proof following vs W=64?
+3. Does ProofPile as stage 2 (vs FineWeb-Edu) produce better constraint structure?
+4. What is the correct logic_mix ratio — does 0.10 over-constrain or under-constrain?
+5. Does sigmoid tension show an outsized advantage on code vs prose, as the constraint-dependency hypothesis predicts?
 
-## Phase 3 — Integration A/B (the real paper experiment)
+---
 
-**Setup:**
-- **System A (control):** `BoggersTheAI` stock — Ollama/Llama-3.2 surface, `UniversalLivingGraph` substrate, unchanged pipeline.
-- **System B (test):** same `BoggersTheAI` pipeline, TensionLM-117M-Curriculum as surface, bidirectional τ ↔ edge coupling via `ts_bridge`.
+## Paper outline
 
-**Question:** does the TS-native surface produce a better-behaved integrated system?
+**Title:** TensionLM: Constraint Relaxation as a Mechanism for Mathematical and Code Reasoning
 
-**Metrics:**
-| Axis | How measured |
-|------|--------------|
-| Answer correctness | Held-out QA set spanning graph domains (100 prompts, human-graded) |
-| Contradiction rate | Fraction of answers containing statements contradicted by the graph at query time |
-| Graph coherence | Mean tension trajectory over 1 h idle operation; lower = more settled |
-| Trace confidence distribution | Histogram of per-trace confidence; System B should skew higher if surface/substrate agree |
-| Closed-loop improvement | After N QLoRA cycles, does answer correctness improve monotonically? |
-
-**Hypothesis:** System B produces fewer contradictions and a more-settled graph, not because TensionLM is a better LLM, but because its internal representation and the external graph do not need to be reconciled through a lossy natural-language bottleneck.
-
-**Failure outcome is acceptable.** If System A ties or beats System B, that's the falsifiable result and we learn something important before further investment.
-
-## Phase 4 — Multi-agent coherence (Wave 16)
-
-TS is already on Wave 16 (multi-agent coordination). Two agents each with a TS-native surface should communicate **more coherently** than two agents with generic LLM surfaces — because their shared medium (the graph) and their private representations (τ fields) are structurally identical.
-
-**Setup:** two `BoggersTheAI` instances, each with TensionLM surface + shared graph. Compare against two instances with Llama surfaces.
-
-**Metric:** after N rounds of communication on an open-ended task, does the shared graph converge (low inter-agent tension) under TensionLM faster than under Llama?
-
-This is the claim that's genuinely novel at the system level and publishable on its own merits. It depends on Phases 1–3 landing first.
-
-## Parallel track — keep training a coherent surface
-
-TensionLM needs to be a *competent* surface for any of Phases 1–4 to matter. Keep the 117M-Curriculum and 350M runs alive in parallel:
-
-**350M stage 1 (bio)** — relaunch with the Phase 0 kernel fix. Stage 1 on synthetic logic (200M tokens), vocab=16384.
-
-**350M stage 2 (bio)** — `run_stage2_350m.sh` — open-web-math 1.1B tokens with `--logic_mix 0.10` (catastrophic-forgetting fix from Exp 5) + the biological training machinery (`--decouple_optim`, `--sparse_grad`, `--sleep_every`, `--ff_mode`). These are not gratuitous LLM tricks; they are TS-cycle operations applied to weight updates (consolidation / contrastive constraints / plastic-window updates).
-
-**117M-Curriculum** — the checkpoint that already hit formal_eval 43.5% at step 14k is the default surface for Phase 1 integration smoke tests. Don't block on 350M to start Phase 1.
-
-## Paper restructure
-
-Retiring: *"TensionLM: Constraint Relaxation as a Mechanism for Mathematical Reasoning"*
-
-Target: *"Substrate-Surface Coherence in a Graph-Native Language Model: Eliminating Representational Mismatch in LLM+Graph Systems"*
+**Contribution claim:** A language model whose attention mechanism directly implements constraint graph relaxation produces interpretable, structured reasoning on formal domains — and the constraint graph itself is a first-class output, not a black-box byproduct.
 
 **Sections:**
-1. The substrate-surface mismatch in LLM+KG systems (motivation)
-2. TS theory — computation as constraint relaxation; shared representation across scales
-3. TensionLM as TS-native surface — sigmoid tension, tau-mass, global layers, Triton kernel
-4. The τ ↔ edge bridge (Phase 1, 2) — interface, head filtering, bias injection
-5. Prior results reframed as surface-viability evidence — Exps 1–5 from the current README, positioned as "the surface can carry graph structure" not "the surface beats softmax at math"
-6. Integration A/B (Phase 3) — the real experiment
-7. Multi-agent coherence (Phase 4) — Wave-16-aligned result
-8. Discussion — scaling outlook, failure modes, open questions
+1. TS-inspired theory — constraint relaxation, why softmax is wrong for formal reasoning
+2. Mechanism — sigmoid tension, tau-mass normalisation, global layers, Triton kernel
+3. Exp 1 — mechanism validation (tension vs transformer at 1.1M)
+4. Exp 2 — TS-native objectives (constraint consistency, tension field coherence)
+5. Exp 3 — curriculum training (first-contact PPL improvement)
+6. Exp 4 — 117M baseline run results
+7. Exp 5 — math + code reasoning model results (this run)
+8. Tension field analysis — transitivity chains, head specialisation, coherence vs salad
+9. Discussion — catastrophic forgetting finding, logic_mix solution, scaling outlook
 
-**Target venue:** arXiv cs.LG / cs.AI (same as before); the narrative is cleaner and the claim more novel.
+**Target:** arXiv cs.LG / cs.AI
 
-## Graph consolidation (prerequisite debt)
+---
 
-Four separate graph implementations currently exist across the ecosystem: TS-Core, BoggersTheAI, BoggersTheMind, BoggersThePulse. The interface spec produced in Phase 1 is the right time to consolidate — pick TS-Core's `UniversalLivingGraph` as source of truth, have all other repos import it. This is tracked but not in the critical path of the phases above; it's a quality-of-life fix that becomes more valuable as the integration work lands.
+## Optional track — Ecosystem integration
 
-## Open questions
+TensionLM's internal representation is already a weighted graph, which makes it an unusually clean target for coupling to an external constraint-graph system. The `ts_bridge/` package explores this as an optional integration track — it does **not** gate the main LLM roadmap.
 
-1. How much of TensionLM's τ field is signal at the graph scale? Head-specialisation analysis suggests 2-3 heads per layer are long-range-semantic; the rest are syntactic noise. Phase 1's head filter is the lever.
-2. What's the right node granularity? Tokens are too fine; concepts from a topic-extraction pass may be the right target (matches `BoggersTheAI` query pipeline's topic extraction).
-3. Does graph biasing need to be per-layer (bias every layer's τ) or only at the global-attention layers? The global layers are the long-range-coupling points — biasing only there may suffice and is cheaper.
-4. Does logic_mix=0.10 actually prevent step-14k degradation in the new run? Needed for a coherent surface; answered by the 350M stage 3 run when it lands.
-5. Is 117M enough for integrated Phase 3 to show a real delta, or do we need 350M as the minimum viable surface?
+| Sub-phase | Status | Deliverable |
+|-----------|--------|-------------|
+| 1.0 | ✓ 91f0068 | `ts_bridge/` scaffold — graph shape, `TauExporter`, head filter, JSON round-trip |
+| 1.1 | ✓ ac213ee | Head-classifier recalibration (quantile-based role assignment over corpus stats) |
+| 1.2 | ✓ 48487b2 | Corpus-level head profiling + 117M Exp 2 replication (1.056× coherence vs published 1.25×) |
+| 1.3 | ✓ 55543bf | Corpus-derived edge-threshold quantiles |
+| 1.5 | ✓ | `StreamingTauExporter` — per-step τ export during generation, parity with batch ingest (527 edges, max-weight Δ = 1.2e-7) |
+| 2.0 | ✓ | `GraphBias` + `tau_bias: [B,T,W]` plumbed through `MultiHeadCausalTensionLayer`, `TensionBlock`, `TensionLM`. No-op invariant exact; responsiveness KL ≈ 1.7e-2; directional KL ≈ 2.6e-1 |
+| 2.1 | ✓ | Closed-loop `biased_generate` — graph biases forward, forward updates graph. Diverges at token 1/20 under matched seeds on diagnostic checkpoint |
+| 2.2 | — | α calibration on 117M-curriculum, global-layer bias, Triton-fused bias, `--export_mode unbiased` to break the positive feedback loop |
+| 3 | — | Integration A/B vs `BoggersTheAI` stock surface on held-out QA (contradiction rate, trace confidence) |
 
-## Current repo layout
+This track is cleanly separable from the main training roadmap. Landing it widens what the surface-level research can inform later; not landing it doesn't invalidate the LLM work.
 
-| File | Role |
-|------|------|
-| `model.py` | TensionLM architecture, aux losses, KV cache generation |
-| `baseline.py` | Baseline transformer (kept for Phase 3 ablation cross-reference) |
-| `train.py` | Training pipeline — DDP, token budget, logic mixing, biological training machinery |
-| `prepare_data.py` | Streaming shard prep |
-| `eval.py` / `formal_eval.py` | Standalone-surface eval (not the main target anymore, but retained) |
+---
+
+## File map
+
+| File | Purpose |
+|------|---------|
+| `model.py` | TensionLM architecture, aux losses, generation, KV cache |
+| `baseline.py` | Baseline transformer (identical API) |
+| `train.py` | Training pipeline — DDP, token budget, logic mixing, biological machinery |
+| `prepare_data.py` | Stream + tokenise large datasets into binary shards |
+| `eval.py` | Perplexity evaluation |
 | `generate.py` | Inference CLI — standard, anchored, cached generation |
-| `visualise.py` | Tension field inspection — inputs for Phase 1 head filtering |
-| `triton_tension/` | Fused kernels (Phase 0 — tau output now supported) |
-| `ts_bridge/` | **New (Phase 1)** — surface ↔ substrate interface |
+| `formal_eval.py` | Formal reasoning benchmark (expand to 100+ questions) |
+| `visualise.py` | Tension field inspection — heatmap, token, layers, stats |
+| `compare.py` | Plot loss curves |
+| `upload_hf.py` | Upload to HuggingFace Hub |
+| `triton_tension/` | Fused Triton kernels (fwd + bwd) |
+| `ts_bridge/` | Optional ecosystem-integration package (exporter, streaming, graph bias, closed-loop gen) |
