@@ -19,17 +19,27 @@ Sampling mirrors `model.generate` (nucleus + rep penalty) so biased vs
 unbiased runs are directly comparable.
 
 Trade-offs kept deliberate:
-- Exported τ is the **post-bias** field, so graph-reinforcement is a
-  positive feedback loop.  For clean Phase 2 acceptance you want
-  `seed_weight` reasonable and `alpha` modest.  An `export=False` flag
-  disables writeback entirely when you want a pure bias A/B.
+- `export_mode` controls which τ field becomes graph edges.
+    "biased"   — export the post-bias τ (positive feedback loop).
+    "unbiased" — second forward per step with tau_bias=None for export
+                 only; sampling still uses the biased forward.  Doubles
+                 forward cost per step but decouples graph growth from
+                 bias strength so α's effect on text can be measured
+                 without feedback-loop confounds.
+    "off"      — disable export entirely (pure bias A/B, no graph grows).
 - Global-attention layers are silently unbiased (their W-dim differs).
   TensionLM.forward already handles that; see bias.py for the split.
+- Prompt prime is always an unbiased forward — the graph is empty or
+  seed-only at that point, and we want a clean starting graph state.
 
 Run:
     python -m ts_bridge.biased_generate \
         --checkpoint checkpoints/diagnostic/latest.pt \
         --prompt "whales are" --alpha 1.0 --max_new 30 --ab
+
+    # Break the positive feedback loop:
+    python -m ts_bridge.biased_generate --checkpoint ... \
+        --alpha 1.0 --export_mode unbiased
 """
 
 from __future__ import annotations
@@ -75,6 +85,9 @@ def _sample_next(
     return int(si[torch.multinomial(sp, 1).item()].item())
 
 
+EXPORT_MODES = ("biased", "unbiased", "off")
+
+
 @torch.no_grad()
 def closed_loop_generate(
     model,
@@ -84,17 +97,32 @@ def closed_loop_generate(
     max_new:     int   = 50,
     alpha:       float = 0.5,
     seed_graph:  UniversalLivingGraph | None = None,
-    export:      bool  = True,
+    export_mode: str   = "biased",
     temp:        float = 0.8,
     top_p:       float = 0.92,
     rep_penalty: float = 1.3,
     device:      str   = "cpu",
     head_override: list[tuple[int, int]] | None = None,
 ) -> tuple[list[int], UniversalLivingGraph]:
-    """Closed-loop generation: graph biases forward, forward updates graph."""
+    """
+    Closed-loop generation: graph biases forward, forward updates graph.
+
+    `export_mode`:
+      - "biased":   graph ingests the post-bias τ (positive feedback).
+      - "unbiased": second forward per step with tau_bias=None for export;
+                    sampling still uses the biased forward.  Doubles the
+                    per-step forward cost but decouples graph growth from
+                    bias strength.
+      - "off":      no export; pure bias experiment.
+    """
+    if export_mode not in EXPORT_MODES:
+        raise ValueError(f"export_mode must be one of {EXPORT_MODES}, "
+                         f"got {export_mode!r}")
+
     cfg     = model.cfg
     W       = cfg.window
     max_ctx = cfg.max_seq_len
+    export  = export_mode != "off"
 
     graph   = seed_graph or UniversalLivingGraph()
     streamer = StreamingTauExporter(
@@ -102,10 +130,12 @@ def closed_loop_generate(
     )
 
     # Prime on the prompt so head-lock is settled and prompt edges exist.
+    # Always unbiased: graph is empty (or seed-only) at prime time, and we
+    # want a consistent prompt-graph regardless of export_mode.
     prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long,
                                  device=device).unsqueeze(0)
-    _, _, all_tau_p = model(prompt_tensor, return_all=True)
     if export:
+        _, _, all_tau_p = model(prompt_tensor, return_all=True)
         streamer.prime(prompt_ids, all_tau_p, tokenizer)
 
     ids = list(prompt_ids)
@@ -122,15 +152,19 @@ def closed_loop_generate(
             ctx, tokenizer, window=W, device=device,
         )
 
-        logits, _, all_tau = model(
+        logits, _, all_tau_biased = model(
             ctx_tensor, return_all=True, tau_bias=bias,
         )
 
         # Export edges ending at current last position (if new).
         curr_last = len(ids) - 1
         if export and curr_last > exported_upto:
+            if export_mode == "biased":
+                all_tau_export = all_tau_biased
+            else:  # "unbiased" — second forward without the graph bias
+                _, _, all_tau_export = model(ctx_tensor, return_all=True)
             streamer.ingest_step(
-                ctx, all_tau, tokenizer, query_abs_pos=curr_last,
+                ctx, all_tau_export, tokenizer, query_abs_pos=curr_last,
             )
             exported_upto = curr_last
 
@@ -159,8 +193,17 @@ def main() -> None:
     ap.add_argument("--top_p",      type=float, default=0.92)
     ap.add_argument("--rep_penalty", type=float, default=1.3)
     ap.add_argument("--seed",       type=int, default=42)
+    ap.add_argument("--export_mode", choices=EXPORT_MODES, default="biased",
+                    help="What τ the graph ingests: biased post-bias field "
+                         "(feedback loop), unbiased second forward (no loop), "
+                         "or off (no export).")
     ap.add_argument("--ab", action="store_true",
-                    help="Also run an unbiased comparison and print both.")
+                    help="Also run an α=0 no-bias baseline and print the "
+                         "diverge-at-token diagnostic.")
+    ap.add_argument("--loop_check", action="store_true",
+                    help="Run biased and unbiased export modes at matched α "
+                         "and print graph-growth difference. Diagnostic for "
+                         "the positive feedback loop.")
     args = ap.parse_args()
 
     model, tokenizer, cfg = load_model(
@@ -168,17 +211,19 @@ def main() -> None:
     )
     prompt_ids = tokenizer.encode(args.prompt).ids[: cfg.max_seq_len]
     print(f"model: dim={cfg.dim} L={cfg.num_layers} H={cfg.num_heads} "
-          f"W={cfg.window}  prompt_tokens={len(prompt_ids)}  α={args.alpha}")
+          f"W={cfg.window}  prompt_tokens={len(prompt_ids)}  "
+          f"α={args.alpha}  export_mode={args.export_mode}")
 
-    # Closed-loop biased run.
+    # Primary closed-loop run.
     _set_seed(args.seed)
     ids_bias, g_bias = closed_loop_generate(
         model, tokenizer, prompt_ids,
         max_new=args.max_new, alpha=args.alpha,
+        export_mode=args.export_mode,
         temp=args.temp, top_p=args.top_p, rep_penalty=args.rep_penalty,
         device=args.device,
     )
-    print(f"\n── biased (closed-loop, α={args.alpha}) ──")
+    print(f"\n── closed-loop (α={args.alpha}, export={args.export_mode}) ──")
     print(tokenizer.decode(ids_bias))
     print(f"final graph: {len(g_bias.nodes)} nodes / {len(g_bias.edges)} edges, "
           f"mean w={g_bias.mean_edge_weight():.3f}")
@@ -187,14 +232,13 @@ def main() -> None:
         _set_seed(args.seed)
         ids_un, _ = closed_loop_generate(
             model, tokenizer, prompt_ids,
-            max_new=args.max_new, alpha=0.0, export=False,
+            max_new=args.max_new, alpha=0.0, export_mode="off",
             temp=args.temp, top_p=args.top_p, rep_penalty=args.rep_penalty,
             device=args.device,
         )
-        print("\n── unbiased (α=0, export off) ──")
+        print("\n── no-bias baseline (α=0, export off) ──")
         print(tokenizer.decode(ids_un))
 
-        # Simple overlap diagnostic: do the generated tails diverge?
         tail_bias = ids_bias[len(prompt_ids):]
         tail_un   = ids_un[len(prompt_ids):]
         first_diff = next(
@@ -203,6 +247,29 @@ def main() -> None:
         )
         print(f"\ndiverge-at (first differing generated token index): {first_diff}"
               f" / {min(len(tail_bias), len(tail_un))}")
+
+    if args.loop_check:
+        # Re-run at matched α with export_mode=unbiased so graph growth is
+        # driven by the model's own τ rather than by the bias we just added.
+        _set_seed(args.seed)
+        ids_ub, g_ub = closed_loop_generate(
+            model, tokenizer, prompt_ids,
+            max_new=args.max_new, alpha=args.alpha,
+            export_mode="unbiased",
+            temp=args.temp, top_p=args.top_p, rep_penalty=args.rep_penalty,
+            device=args.device,
+        )
+        print(f"\n── loop-check: unbiased-export rerun (α={args.alpha}) ──")
+        print(tokenizer.decode(ids_ub))
+        print(f"graph: {len(g_ub.nodes)} nodes / {len(g_ub.edges)} edges, "
+              f"mean w={g_ub.mean_edge_weight():.3f}")
+        # Compare to the primary run's graph (only meaningful if primary was
+        # biased-export; otherwise the two runs have the same export mode).
+        if args.export_mode == "biased":
+            de = len(g_bias.edges) - len(g_ub.edges)
+            dm = g_bias.mean_edge_weight() - g_ub.mean_edge_weight()
+            print(f"feedback-loop delta: Δedges={de:+d}  "
+                  f"Δmean_w={dm:+.3f}")
 
 
 if __name__ == "__main__":
