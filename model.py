@@ -626,9 +626,10 @@ def generate(
     model.eval()
     ids     = list(input_ids)
     max_ctx = model.cfg.max_seq_len
+    device  = next(model.parameters()).device
 
     for _ in range(max_new):
-        ctx    = torch.tensor([ids[-max_ctx:]], dtype=torch.long)
+        ctx    = torch.tensor([ids[-max_ctx:]], dtype=torch.long, device=device)
         logits = model(ctx)[0, -1].float()
 
         # Repetition penalty over the last 32 tokens

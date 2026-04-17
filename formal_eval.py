@@ -7,11 +7,17 @@ Scores each answer and reports accuracy vs a keyword-match ground truth.
 Usage:
     python formal_eval.py --checkpoint checkpoints/stage3_math_117m/ckpt_0014000.pt
     python formal_eval.py --checkpoint checkpoints/stage3_math_117m/ckpt_0014000.pt --temp 0.3
+    # Override tokenizer (when the checkpoint's tok_path is stale) and run on CUDA:
+    python formal_eval.py --checkpoint checkpoints/117m-curriculum/pytorch_model.pt \
+        --tokenizer checkpoints/117m-curriculum/tokenizer.json --device cuda
 """
 
 import argparse
 import sys
 import torch
+
+sys.path.insert(0, __file__ and __import__("os").path.dirname(__file__) or ".")
+from ts_bridge.smoke_test import _migrate_fused_kv                  # noqa: E402
 
 
 BENCHMARK = [
@@ -171,28 +177,35 @@ def score(output: str, accept: list, reject: list) -> bool:
     return hit and no_reject
 
 
-def load_model(ckpt_path: str):
+def load_model(ckpt_path: str, device: str = "cpu", tokenizer_path: str | None = None):
     from model import TensionConfig, TensionLM, generate as _generate
     print(f"Loading {ckpt_path} ...")
-    ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg   = TensionConfig(**ckpt["cfg"])
+    ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg_dict = dict(ckpt["cfg"])
+    # Force reference path unless caller's on CUDA — same guard as smoke_test.
+    if device == "cpu":
+        cfg_dict["use_triton"] = False
+    cfg   = TensionConfig(**cfg_dict)
     model = TensionLM(cfg)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model"].items()}
+    state = _migrate_fused_kv(state, cfg)
     model.load_state_dict(state)
-    model.eval()
+    model.eval().to(device)
 
     from tokenizers import Tokenizer
-    tokenizer = Tokenizer.from_file(ckpt["tok_path"])
+    tok_path = tokenizer_path or ckpt["tok_path"]
+    tokenizer = Tokenizer.from_file(tok_path)
 
     ppl = ckpt.get("val_ppl", "?")
     ppl_str = f"{ppl:.2f}" if isinstance(ppl, float) else str(ppl)
-    print(f"Model  : {model.num_params:,} params  |  val ppl {ppl_str}")
+    print(f"Model  : {model.num_params:,} params  |  val ppl {ppl_str}  |  device {device}")
     print(f"Step   : {ckpt.get('step', '?')}\n")
     return model, tokenizer, _generate
 
 
-def run_eval(ckpt_path: str, max_new: int = 40, temp: float = 0.3, top_p: float = 0.9):
-    model, tokenizer, _generate = load_model(ckpt_path)
+def run_eval(ckpt_path: str, max_new: int = 40, temp: float = 0.3, top_p: float = 0.9,
+             device: str = "cpu", tokenizer_path: str | None = None):
+    model, tokenizer, _generate = load_model(ckpt_path, device, tokenizer_path)
 
     results = []
     categories = {}
@@ -236,8 +249,13 @@ def main():
     p.add_argument("--max_new",    default=40,  type=int)
     p.add_argument("--temp",       default=0.3, type=float)
     p.add_argument("--top_p",      default=0.9, type=float)
+    p.add_argument("--device",     default="cpu")
+    p.add_argument("--tokenizer",  default=None,
+                   help="Override tokenizer path (default: ckpt['tok_path']). "
+                        "Needed when the checkpoint's tok_path is stale.")
     args = p.parse_args()
-    run_eval(args.checkpoint, args.max_new, args.temp, args.top_p)
+    run_eval(args.checkpoint, args.max_new, args.temp, args.top_p,
+             device=args.device, tokenizer_path=args.tokenizer)
 
 
 if __name__ == "__main__":
