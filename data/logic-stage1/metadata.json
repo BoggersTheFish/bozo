@@ -1,8 +1,8 @@
 {
   "dataset": "logic-stage1",
   "description": "Synthetic pure logical inference dataset \u2014 TS stage 1 curriculum",
-  "vocab_size": 16384,
-  "tokenizer": "data/tokenizer.json",
+  "vocab_size": 32768,
+  "tokenizer": "checkpoints/117m-curriculum/tokenizer.json",
   "total_tokens": 200000000,
   "train_tokens": 190000000,
   "val_tokens": 10000000,

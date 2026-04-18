@@ -116,6 +116,23 @@ RoPE, tau-mass normalisation, global attention every 4 blocks, scaled weight ini
 
 ---
 
+### Experiment 6 — logic_mix=0.10 preliminary (117M)
+
+An abbreviated 2-stage run to test whether `--logic_mix 0.10` keeps Stage 1 structure alive through the math stage. Stage 1: 200M synthetic logic from scratch (vocab=32768, best val 9.56 @ step 500). Stage 2 (ProofPile) **skipped**. Stage 3: 1.1B open-web-math + 10% logic mix, resumed from Stage 1 step-500.
+
+| Checkpoint | Val PPL | formal_eval | Transitivity | Math categories |
+|-----------|---------|-------------|--------------|-----------------|
+| 117M-curriculum (forgotten) | 360 | 3/23 (13%) | 1/3 | 6/13 |
+| Stage 1 step-500 (logic only) | 9.56 | 3/23 (13%) | — | 0/13 |
+| **Stage 3 + logic_mix=0.10** | **317** | 4/23 (17%) | **2/3 (67%)** | 0/13 |
+
+**What we learned:**
+- logic_mix=0.10 *does* preserve what Stage 1 taught — transitivity templates carry through 1.1B math tokens untouched.
+- It is *not* a substitute for Stage 2 or for scale — without ProofPile as a math-language bridge, and at 1.1B tokens instead of the planned 5B, arithmetic / calculus / algebra / definitions all stay at 0%.
+- Val curve is monotone over the run — no step-14k-style regression. The forgetting-prevention half of the hypothesis holds; the reasoning-emergence half needs Stage 2 and the full budget.
+
+---
+
 ## What the tension field shows
 
 **Simultaneous non-competitive constraints.** In softmax, if a token attends strongly to position A it attends less to B — they compete. In TensionLM, layer 12 head 0 on "Manchester United won the Premier League title":

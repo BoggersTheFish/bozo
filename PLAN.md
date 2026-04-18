@@ -31,6 +31,14 @@ Logic → language → maths. First-contact maths PPL: cold start ~2293, logic o
 - Overall: **43.5%** — algebra 67%, calculus 50%, arithmetic 50%, transitivity 33%, syllogisms 17%
 - Critical finding: **step 14,000 beats the final checkpoint** — epoch 2 of maths data partially overwrites stage 1 logic structure. Any new training must prevent this.
 
+### logic_mix=0.10 preliminary (Exp 6 — 117M, abbreviated 2-stage run, 2026-04-18)
+- **Run shape:** Stage 1 (200M synthetic logic, vocab=32768, from scratch, best val 9.56 @ step 500) → Stage 3 (1.1B open-web-math + `--logic_mix 0.10`, resumed from Stage 1 step-500). Stage 2 / ProofPile **skipped**. Vocab reused 117M-curriculum's 32768 tokenizer rather than the planned GPT-2 50257 — not a clean test of the full plan.
+- **Final val ppl 317.96 / best 317.52** at step 16500. Monotone descent 1365 → 317 with no step-14k-style regression.
+- **formal_eval:** 4/23 (17.4%) @ temp 0.1; 3/23 (13%) @ temp 0.3. Same overall rate as the forgotten 117M-curriculum baseline (3/23) despite better val ppl.
+- **Signal:** transitivity 2/3 (67%) — logic templates measurably persist under logic_mix=0.10. Qualitative difference from forgotten baseline — coherent math English, no repetition loops, topical near-misses (e.g. Pythagorean → "hypoteniori").
+- **What logic_mix=0.10 did NOT do:** induce arithmetic / calculus / algebra / definitional reasoning (all 0%). Stage 1 synthetic logic is too narrow a prior on its own; without Stage 2 (ProofPile) the math-language substrate is thin, and 1.1B tokens of open-web-math is a fraction of the planned 5B.
+- **Takeaway:** logic_mix works as a forgetting-preventer on the data it was taught. Does not substitute for Stage 2 or for scale. Next run should include ProofPile and the planned 5B budget before judging the ratio.
+
 ### Tension field (117M)
 - `Manchester:0.95 United:0.95` simultaneously — impossible in softmax
 - Syllogism: both logical subjects at equal full strength simultaneously
@@ -170,10 +178,10 @@ After the math+code reasoning model is validated:
 
 ## Open questions to answer with this run
 
-1. Does logic_mix=0.10 prevent the step-14k degradation? (Track formal eval every 5k steps)
+1. ~~Does logic_mix=0.10 prevent the step-14k degradation?~~ **Partially answered (Exp 6):** logic_mix=0.10 *does* preserve the transitivity templates taught in Stage 1 (67% transitivity at val ppl 317), and the val curve is monotone over 1.1B tokens with no step-14k-style regression. It does *not* substitute for Stage 2 or for the full token budget — math categories stay at 0% without them.
 2. Does W=256 meaningfully improve multi-step proof following vs W=64?
 3. Does ProofPile as stage 2 (vs FineWeb-Edu) produce better constraint structure?
-4. What is the correct logic_mix ratio — does 0.10 over-constrain or under-constrain?
+4. What is the correct logic_mix ratio — 0.10 preserves what's taught but may need to be higher (0.15 – 0.20) to carry weaker priors through a longer stage 3.
 5. Does sigmoid tension show an outsized advantage on code vs prose, as the constraint-dependency hypothesis predicts?
 
 ---
