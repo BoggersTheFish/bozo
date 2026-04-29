@@ -149,6 +149,21 @@ python3 formal_eval.py --checkpoint checkpoints/stage3_math_117m/ckpt_0014000.pt
 
 ## What the tension field shows
 
+The public Hugging Face checkpoints now include model-card heatmaps rendered directly from their `model.safetensors` files. Each image uses:
+
+`If all mammals are warm blooded and all whales are mammals then`
+
+Rows are target tokens being constrained, columns are earlier source tokens providing the constraint, and brighter cells mean higher mean τ averaged across heads and layers. These are not softmax attention maps: tension scores are independent sigmoid constraints, so a target token can stay bright against several earlier tokens at the same time.
+
+| Checkpoint | Average causal tension heatmap |
+|------------|--------------------------------|
+| TensionLM-117M | ![TensionLM-117M heatmap](docs/heatmaps/tensionlm-117m-tension-heatmap.png) |
+| TensionLM-117M-FineWeb | ![TensionLM-117M-FineWeb heatmap](docs/heatmaps/tensionlm-117m-fineweb-tension-heatmap.png) |
+| TensionLM-117M-Curriculum | ![TensionLM-117M-Curriculum heatmap](docs/heatmaps/tensionlm-117m-curriculum-tension-heatmap.png) |
+| TensionLM-117M-Curriculum-Stage2 | ![TensionLM-117M-Curriculum-Stage2 heatmap](docs/heatmaps/tensionlm-117m-curriculum-stage2-tension-heatmap.png) |
+| TensionLM-Curriculum-13M | ![TensionLM-Curriculum-13M heatmap](docs/heatmaps/tensionlm-curriculum-13m-tension-heatmap.png) |
+| TensionLM-Phase2-TSNative | ![TensionLM-Phase2-TSNative heatmap](docs/heatmaps/tensionlm-phase2-tsnative-tension-heatmap.png) |
+
 The tension field is inspectable — you can read what the model has learned directly from τ values.
 
 **Simultaneous non-competitive constraints.** In softmax, if a token attends strongly to position A it attends less to position B — they compete. In TensionLM a token can be simultaneously pulled by all its relevant predecessors at full strength. In the 117M model (layer 12, head 0), "title" in "Manchester United won the Premier League title":
